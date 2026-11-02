@@ -139,4 +139,4 @@ tools/gen_cn_fonts.sh    # 需要 Node/npx；字体首次会自动下载
 - 缩略图依赖非官方 `/view` 接口；mp4 本身无缩略图，需工作流提供 `workflow` 封面。
 - 双机框架只轮询前两台，且只有当前页的产物会拉缩略图/码率。
 - 主题/语言/框架切换会重启设备（约 3 秒）。
-- 未附 LICENSE，发布前请按需要选择（MIT/Apache-2.0 等）。
+- MIT License（见 `LICENSE`）；中文字体为 Noto Sans CJK SC 子集，遵循 SIL OFL 1.1。
