@@ -1,0 +1,35 @@
+--- src/databus/Arduino_ESP32SPI.cpp
++++ src/databus/Arduino_ESP32SPI.cpp
+@@ -127,7 +127,7 @@
+   }
+   else
+   {
+-    _spi->dev->clock.val = spiFrequencyToClockDiv(old_apb / ((_spi->dev->clock.clkdiv_pre + 1) * (_spi->dev->clock.clkcnt_n + 1)));
++    _spi->dev->clock.val = spiFrequencyToClockDiv(_spi, old_apb / ((_spi->dev->clock.clkdiv_pre + 1) * (_spi->dev->clock.clkcnt_n + 1)));
+     SPI_MUTEX_UNLOCK();
+   }
+ }
+@@ -174,7 +174,7 @@
+ 
+   if (!_div)
+   {
+-    _div = spiFrequencyToClockDiv(_speed);
++    _div = spiFrequencyToClockDiv(&_spi_bus_array[_spi_num], _speed);
+   }
+ 
+   // set pin mode
+--- src/databus/Arduino_ESP32SPIDMA.cpp
++++ src/databus/Arduino_ESP32SPIDMA.cpp
+@@ -58,10 +58,12 @@
+   _speed = (speed == GFX_NOT_DEFINED) ? SPI_DEFAULT_FREQ : speed;
+   _dataMode = (dataMode == GFX_NOT_DEFINED) ? SPI_MODE0 : dataMode;
+ 
++#if !defined(ESP_ARDUINO_VERSION) || (ESP_ARDUINO_VERSION < ESP_ARDUINO_VERSION_VAL(3, 3, 6))
+   if (!_div)
+   {
+     _div = spiFrequencyToClockDiv(_speed);
+   }
++#endif
+ 
+   // set pin mode
+   if (_dc != GFX_NOT_DEFINED)

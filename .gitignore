@@ -1,0 +1,13 @@
+# macOS / exFAT metadata
+._*
+.DS_Store
+
+# Build artifacts
+build/
+*.raw
+*.bin
+*.zip
+
+# Local assets (generated on demand)
+tools/fonts/*.otf
+tools/samples/
