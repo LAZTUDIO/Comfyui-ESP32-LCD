@@ -1,16 +1,19 @@
 #!/usr/bin/env bash
-# Regenerate the LVGL CJK font subsets from Noto Sans CJK SC (SIL OFL 1.1).
+# Regenerate the LVGL CJK font subsets (SIL OFL 1.1).
+# Uses Source Han Sans SC (same design as Noto Sans CJK SC) from the TUNA mirror;
+# jsDelivr Noto is only a fallback because it throttles large downloads in CN.
 # Requires Node.js (npx); lv_font_conv is fetched on demand.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
 FONT_DIR="tools/fonts"
-FONT="$FONT_DIR/NotoSansCJKsc-Regular.otf"
+FONT="$FONT_DIR/SourceHanSansSC-Regular.otf"
 mkdir -p "$FONT_DIR" firmware/comfyui_panel
 
 if [ ! -f "$FONT" ]; then
-  echo "downloading Noto Sans CJK SC (OFL)..."
-  curl -fL -o "$FONT" "https://cdn.jsdelivr.net/gh/notofonts/noto-cjk@main/Sans/OTF/SimplifiedChinese/NotoSansCJKsc-Regular.otf"
+  echo "downloading Source Han Sans SC (OFL)..."
+  curl -fL --connect-timeout 10 --max-time 300 -o "$FONT" \
+    "https://mirrors.tuna.tsinghua.edu.cn/adobe-fonts/source-han-sans/OTF/SimplifiedChinese/SourceHanSansSC-Regular.otf"
 fi
 
 SYMBOLS_FILE=$(mktemp)
@@ -24,4 +27,4 @@ for size in 12 14 16 20; do
     -o "firmware/comfyui_panel/cn_font_$size.c"
 done
 rm -f "$SYMBOLS_FILE"
-echo "done. fonts are subsets of Noto Sans CJK SC (SIL OFL 1.1, see firmware/comfyui_panel/fonts/OFL.txt)"
+echo "done. fonts are subsets of Source Han Sans SC (SIL OFL 1.1, see firmware/comfyui_panel/fonts/OFL.txt)"

@@ -1,0 +1,405 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>灵枢观星台 · ComfyUI 看板助手</title>
+<style>
+:root{
+  --bg:#060913; --panel:rgba(13,20,38,.88); --panel2:rgba(9,14,28,.92);
+  --gold:#e8c476; --gold-dim:rgba(232,196,118,.18); --cyan:#45e0ff; --jade:#57e6a8;
+  --purple:#b48cff; --red:#ff5c7a; --txt:#dce6f7; --mut:#7e8db0; --line:rgba(232,196,118,.16);
+}
+*{box-sizing:border-box;margin:0;padding:0}
+body{
+  background:var(--bg); color:var(--txt); min-height:100vh;
+  font-family:"PingFang SC","Microsoft YaHei","Noto Sans SC",sans-serif; font-size:14px;
+  background-image:
+    radial-gradient(1100px 500px at 15% -10%, rgba(69,224,255,.07), transparent 60%),
+    radial-gradient(900px 480px at 90% 0%, rgba(180,140,255,.08), transparent 60%),
+    radial-gradient(700px 700px at 50% 120%, rgba(232,196,118,.05), transparent 60%);
+}
+body::after{content:"";position:fixed;inset:0;pointer-events:none;
+  background:repeating-linear-gradient(0deg,rgba(255,255,255,.012) 0 1px,transparent 1px 3px);}
+.serif{font-family:"Noto Serif SC","Songti SC","STSong","SimSun",serif}
+.wrap{max-width:1440px;margin:0 auto;padding:18px 20px 40px}
+header{display:flex;align-items:center;gap:16px;flex-wrap:wrap;padding:6px 2px 16px}
+.seal{width:46px;height:46px;border:1px solid var(--gold);color:var(--gold);display:flex;
+  align-items:center;justify-content:center;font-size:24px;border-radius:6px;
+  box-shadow:0 0 18px rgba(232,196,118,.25), inset 0 0 12px rgba(232,196,118,.12);
+  font-family:"Noto Serif SC","Songti SC",serif;}
+h1{font-size:22px;letter-spacing:4px;color:var(--gold);font-weight:600}
+h1 small{display:block;font-size:11px;letter-spacing:2px;color:var(--mut);font-weight:400;margin-top:3px}
+.chips{display:flex;gap:8px;flex-wrap:wrap;margin-left:auto;align-items:center}
+.chip{border:1px solid var(--line);border-radius:4px;padding:4px 10px;font-size:12px;color:var(--mut);
+  background:var(--panel2)}
+.chip b{color:var(--txt);font-weight:500}
+.realm{border:1px solid var(--gold);color:var(--gold);padding:5px 14px;border-radius:4px;
+  font-size:14px;letter-spacing:3px;background:linear-gradient(180deg,rgba(232,196,118,.12),rgba(232,196,118,.03));
+  text-shadow:0 0 12px rgba(232,196,118,.5)}
+.realm.hot{animation:pulse 1.6s ease-in-out infinite}
+@keyframes pulse{50%{box-shadow:0 0 22px rgba(232,196,118,.45)}}
+#warn{display:none;border:1px solid rgba(255,92,122,.5);background:rgba(255,92,122,.08);
+  color:#ffb3c2;padding:10px 14px;border-radius:6px;margin-bottom:14px;font-size:13px}
+.grid{display:grid;grid-template-columns:repeat(12,1fr);gap:12px}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:14px 16px;
+  position:relative;overflow:hidden}
+.card::before,.card::after{content:"";position:absolute;width:10px;height:10px;border-color:var(--gold);border-style:solid;opacity:.55}
+.card::before{top:4px;left:4px;border-width:1px 0 0 1px}
+.card::after{bottom:4px;right:4px;border-width:0 1px 1px 0}
+.card h2{font-size:14px;color:var(--gold);letter-spacing:3px;font-weight:600;margin-bottom:10px;
+  display:flex;align-items:baseline;gap:8px}
+.card h2 .en{font-size:10px;color:var(--mut);letter-spacing:1px;font-weight:400}
+.card h2 .tag{margin-left:auto;font-size:11px;color:var(--mut);letter-spacing:0}
+.span2{grid-column:span 2}.span3{grid-column:span 3}.span4{grid-column:span 4}
+.span5{grid-column:span 5}.span6{grid-column:span 6}.span8{grid-column:span 8}.row2{grid-row:span 2}
+.bigrow{display:flex;align-items:center;gap:16px}
+.ring{width:92px;height:92px;border-radius:50%;flex:none;display:flex;align-items:center;justify-content:center;
+  background:conic-gradient(var(--cyan) 0%, rgba(126,141,176,.15) 0)}
+.ring .in{width:74px;height:74px;border-radius:50%;background:#0a1122;display:flex;flex-direction:column;
+  align-items:center;justify-content:center}
+.ring .v{font-size:21px;font-weight:600;font-variant-numeric:tabular-nums}
+.ring .u{font-size:10px;color:var(--mut)}
+.kv{display:grid;grid-template-columns:auto 1fr;gap:4px 12px;font-size:12.5px;min-width:0}
+.kv .k{color:var(--mut)} .kv .v{text-align:right;font-variant-numeric:tabular-nums;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.bar{height:6px;border-radius:3px;background:rgba(126,141,176,.15);overflow:hidden;margin-top:6px}
+.bar i{display:block;height:100%;border-radius:3px;background:var(--cyan);transition:width .5s}
+.cores{display:flex;gap:2px;align-items:flex-end;height:34px;margin-top:10px}
+.cores i{flex:1;background:linear-gradient(180deg,var(--cyan),rgba(69,224,255,.25));border-radius:1px;min-height:2px;transition:height .5s}
+.sub{font-size:11.5px;color:var(--mut);margin-top:8px}
+.stateline{display:flex;align-items:center;gap:10px;margin-bottom:10px}
+.dot{width:9px;height:9px;border-radius:50%;background:var(--mut)}
+.dot.on{background:var(--jade);box-shadow:0 0 10px var(--jade)}
+.dot.off{background:var(--red)} .dot.mid{background:var(--gold);box-shadow:0 0 10px var(--gold)}
+.statetxt{font-size:17px;letter-spacing:2px}
+.btns{display:flex;gap:8px;margin:12px 0 8px}
+button{cursor:pointer;border-radius:5px;padding:8px 14px;font-size:13px;letter-spacing:2px;
+  border:1px solid var(--line);background:var(--panel2);color:var(--txt)}
+button:hover{border-color:var(--gold)}
+button.primary{border-color:var(--jade);color:var(--jade);background:rgba(87,230,168,.08)}
+button.danger{border-color:var(--red);color:var(--red);background:rgba(255,92,122,.07)}
+button:disabled{opacity:.4;cursor:not-allowed}
+#comfyMsg{font-size:12px;color:var(--mut);min-height:16px}
+pre{font-family:"SF Mono",Consolas,monospace;font-size:11.5px;line-height:1.55;color:#9fb4d8;
+  background:var(--panel2);border:1px solid rgba(126,141,176,.15);border-radius:6px;
+  padding:10px;height:220px;overflow-y:auto;white-space:pre-wrap;word-break:break-all}
+canvas{width:100%;height:170px;display:block}
+.legend{display:flex;gap:14px;font-size:11.5px;color:var(--mut);margin-top:6px;flex-wrap:wrap}
+.legend i{display:inline-block;width:9px;height:9px;border-radius:2px;margin-right:5px}
+label{display:block;font-size:12px;color:var(--mut);margin:9px 0 4px}
+input,textarea{width:100%;background:var(--panel2);border:1px solid rgba(126,141,176,.25);
+  border-radius:5px;color:var(--txt);padding:7px 9px;font-size:12.5px;font-family:inherit}
+textarea{resize:vertical;min-height:52px}
+input:focus,textarea:focus{outline:none;border-color:var(--gold)}
+.hint{font-size:11.5px;color:var(--mut);line-height:1.6;margin-top:10px}
+.hint b{color:var(--gold)}
+footer{margin-top:22px;text-align:center;color:var(--mut);font-size:11px;letter-spacing:2px}
+@media(max-width:1100px){.span2,.span3,.span4,.span5{grid-column:span 6}.span8{grid-column:span 12}.row2{grid-row:auto}}
+@media(max-width:720px){.grid>*{grid-column:span 12 !important}}
+</style>
+</head>
+<body>
+<div class="wrap">
+<header>
+  <div class="seal">枢</div>
+  <h1 class="serif">灵枢观星台<small>COMFYUI PANEL ASSISTANT · 赛博修仙工况看板</small></h1>
+  <div class="chips">
+    <span class="chip">主机 <b id="hHost">--</b></span>
+    <span class="chip">IP <b id="hIp">--</b></span>
+    <span class="chip">系统 <b id="hOs">--</b></span>
+    <span class="chip" id="hClock">--:--:--</span>
+    <span class="realm serif" id="realm">凡尘</span>
+  </div>
+</header>
+<div id="warn"></div>
+<div class="grid">
+
+  <div class="card span4">
+    <h2 class="serif">灵枢 · CPU<span class="en">PROCESSOR</span><span class="tag" id="cpuCount"></span></h2>
+    <div class="bigrow">
+      <div class="ring" id="cpuRing"><div class="in"><span class="v" id="cpuPct">--</span><span class="u">占用 %</span></div></div>
+      <div class="kv" style="flex:1">
+        <span class="k">频率</span><span class="v" id="cpuFreq">--</span>
+        <span class="k">温度</span><span class="v" id="cpuTemp">--</span>
+        <span class="k">封装功耗</span><span class="v" id="cpuW">--</span>
+        <span class="k">负载</span><span class="v" id="cpuLoad">--</span>
+      </div>
+    </div>
+    <div class="cores" id="cores"></div>
+    <div class="sub" id="coresNote">每核占用</div>
+  </div>
+
+  <div class="card span5">
+    <h2 class="serif">玄光 · GPU<span class="en">GRAPHICS</span><span class="tag" id="gpuVendor"></span></h2>
+    <div class="bigrow">
+      <div class="ring" id="gpuRing" style="--c:var(--purple)"><div class="in"><span class="v" id="gpuPct">--</span><span class="u">占用 %</span></div></div>
+      <div class="kv" style="flex:1">
+        <span class="k">型号</span><span class="v" id="gpuName">--</span>
+        <span class="k">核心频率</span><span class="v" id="gpuClk">--</span>
+        <span class="k">温度</span><span class="v" id="gpuTemp">--</span>
+        <span class="k">功耗</span><span class="v" id="gpuW">--</span>
+        <span class="k">风扇</span><span class="v" id="gpuFan">--</span>
+      </div>
+    </div>
+    <div class="sub">显存 <span id="gpuMemTxt">--</span></div>
+    <div class="bar"><i id="gpuMemBar" style="background:var(--purple);width:0%"></i></div>
+  </div>
+
+  <div class="card span3 row2">
+    <h2 class="serif">丹炉 · ComfyUI<span class="en">ENGINE</span></h2>
+    <div class="stateline"><span class="dot" id="comfyDot"></span><span class="statetxt serif" id="comfyState">--</span></div>
+    <div class="kv">
+      <span class="k">版本</span><span class="v" id="comfyVer">--</span>
+      <span class="k">PyTorch</span><span class="v" id="comfyTorch">--</span>
+      <span class="k">设备</span><span class="v" id="comfyDev">--</span>
+      <span class="k">进程</span><span class="v" id="comfyPid">--</span>
+      <span class="k">生成中</span><span class="v" id="comfyRun">--</span>
+      <span class="k">排队</span><span class="v" id="comfyPend">--</span>
+      <span class="k">本任务耗时</span><span class="v" id="comfyDur">--</span>
+    </div>
+    <div class="btns">
+      <button class="primary" id="btnStart">启 炉</button>
+      <button class="danger" id="btnStop">闭 关</button>
+    </div>
+    <div id="comfyMsg"></div>
+    <div class="hint">启停与本机手动操作等效：助手以本地进程组方式拉起/终止。<b>助手须运行在本机桌面会话</b>（非 SSH），否则 GPU 性能可能受限。</div>
+  </div>
+
+  <div class="card span2">
+    <h2 class="serif">气海 · 内存<span class="en">RAM</span></h2>
+    <div class="ring" id="ramRing" style="--c:var(--jade);width:78px;height:78px"><div class="in" style="width:62px;height:62px"><span class="v" id="ramPct" style="font-size:17px">--</span><span class="u">%</span></div></div>
+    <div class="sub" id="ramTxt">--</div>
+  </div>
+
+  <div class="card span2">
+    <h2 class="serif">神识 · 显存<span class="en">VRAM</span></h2>
+    <div class="ring" id="vramRing" style="--c:var(--gold);width:78px;height:78px"><div class="in" style="width:62px;height:62px"><span class="v" id="vramPct" style="font-size:17px">--</span><span class="u">%</span></div></div>
+    <div class="sub" id="vramTxt">--</div>
+  </div>
+
+  <div class="card span3">
+    <h2 class="serif">灵力 · 功耗<span class="en">POWER</span></h2>
+    <div style="font-size:30px;font-weight:600;color:var(--gold);font-variant-numeric:tabular-nums"><span id="totW">--</span> <span style="font-size:13px;color:var(--mut)">W</span></div>
+    <div class="kv" style="margin-top:8px">
+      <span class="k">GPU</span><span class="v" id="pGpu">--</span>
+      <span class="k">CPU 封装</span><span class="v" id="pCpu">--</span>
+    </div>
+    <div class="sub" id="pNote"></div>
+  </div>
+
+  <div class="card span2">
+    <h2 class="serif">寿元 · 系统<span class="en">SYSTEM</span></h2>
+    <div class="kv">
+      <span class="k">运行时长</span><span class="v" id="sysUp">--</span>
+      <span class="k">进程数</span><span class="v" id="sysProcs">--</span>
+      <span class="k">助手端口</span><span class="v" id="sysPort">--</span>
+      <span class="k">Python</span><span class="v" id="sysPy">--</span>
+    </div>
+  </div>
+
+  <div class="card span6">
+    <h2 class="serif">观星 · 趋势<span class="en">TRENDS · 5 MIN</span></h2>
+    <canvas id="chart" height="170"></canvas>
+    <div class="legend">
+      <span><i style="background:var(--cyan)"></i>CPU</span>
+      <span><i style="background:var(--purple)"></i>GPU</span>
+      <span><i style="background:var(--jade)"></i>内存</span>
+      <span><i style="background:var(--gold)"></i>显存</span>
+      <span><i style="background:var(--red)"></i>功耗(归一)</span>
+    </div>
+  </div>
+
+  <div class="card span3">
+    <h2 class="serif">藏经阁 · 磁盘<span class="en">DISK</span></h2>
+    <div class="kv">
+      <span class="k">路径</span><span class="v" id="diskPath">--</span>
+      <span class="k">容量</span><span class="v" id="diskTotal">--</span>
+      <span class="k">剩余</span><span class="v" id="diskFree">--</span>
+      <span class="k">读取</span><span class="v" id="diskR">--</span>
+      <span class="k">写入</span><span class="v" id="diskW">--</span>
+    </div>
+    <div class="bar"><i id="diskBar" style="background:var(--gold);width:0%"></i></div>
+    <div class="sub" id="diskPct"></div>
+  </div>
+
+  <div class="card span3">
+    <h2 class="serif">传音符 · 网络<span class="en">NETWORK</span></h2>
+    <div class="kv">
+      <span class="k">接收</span><span class="v" id="netRx">--</span>
+      <span class="k">发送</span><span class="v" id="netTx">--</span>
+      <span class="k">ComfyUI 地址</span><span class="v" id="netComfy">--</span>
+      <span class="k">助手版本</span><span class="v" id="netVer">--</span>
+    </div>
+    <div class="sub">ESP32 Ultra 数据源：<span id="panelUrl" style="color:var(--cyan)">--</span></div>
+  </div>
+
+  <div class="card span8">
+    <h2 class="serif">炉边语录 · 运行日志<span class="en">COMFYUI LOG</span><span class="tag" id="logTag"></span></h2>
+    <pre id="logs">（助手管理的 ComfyUI 进程日志会显示在这里；外部启动的进程无日志管道）</pre>
+  </div>
+
+  <div class="card span4">
+    <h2 class="serif">阵法设置<span class="en">CONFIG</span></h2>
+    <label>ComfyUI 地址</label><input id="cfgUrl" placeholder="http://127.0.0.1:8188">
+    <label>ComfyUI 工作目录</label><input id="cfgDir" placeholder="/home/user/ComfyUI 或 D:\jz-comfyui">
+    <label>启动命令（与本机手动启动完全一致）</label>
+    <textarea id="cfgCmd" placeholder="Linux: python main.py --listen 0.0.0.0&#10;Windows: AutoLaunch_ComfyUI.bat"></textarea>
+    <div class="btns"><button id="btnSave">保存阵法</button></div>
+    <div id="cfgMsg" class="sub"></div>
+    <div class="hint">Linux 建议以桌面终端或 systemd 服务运行助手；Windows 建议放入「启动」文件夹或交互式计划任务。<b>切勿在 SSH 会话里常驻。</b></div>
+  </div>
+
+</div>
+<footer>灵枢观星台 · COMFYUI PANEL ASSISTANT · 数据每秒更新</footer>
+</div>
+
+<script>
+const $=id=>document.getElementById(id);
+const GB=1073741824;
+const fmtB=v=>v==null?'--':(v>=GB?(v/GB).toFixed(1)+' GB':(v/1048576).toFixed(0)+' MB');
+const fmtRate=v=>v==null?'--':(v>=1048576?(v/1048576).toFixed(1)+' MB/s':(v/1024).toFixed(0)+' KB/s');
+const fmtDur=s=>{if(s==null)return'--';s=Math.floor(s);const h=Math.floor(s/3600),m=Math.floor(s%3600/60),x=s%60;
+  return (h?h+'时':'')+String(m).padStart(2,'0')+'分'+String(x).padStart(2,'0')+'秒';};
+const fmtMS=ms=>{if(!ms)return'--';const s=Math.floor(ms/1000);return String(Math.floor(s/60)).padStart(2,'0')+':'+String(s%60).padStart(2,'0');};
+const pctTxt=v=>v==null?'--':Math.round(v)+'%';
+function ring(id,v,color){const el=$(id);const p=v==null?0:Math.max(0,Math.min(100,v));
+  el.style.background=`conic-gradient(${color} ${p}%, rgba(126,141,176,.15) ${p}%)`;}
+const COLORS={cpu:'#45e0ff',gpu:'#b48cff',ram:'#57e6a8',vram:'#e8c476',w:'#ff5c7a'};
+let hist=[],maxW=100,offline=false;
+
+function realmOf(gpu,up){
+  if(!up)return['凡尘',false];
+  if(gpu==null)return['入定',false];
+  if(gpu<5)return['辟谷',false];
+  if(gpu<25)return['炼气',false];
+  if(gpu<50)return['筑基',false];
+  if(gpu<75)return['金丹',true];
+  if(gpu<92)return['元婴',true];
+  return['化神',true];
+}
+function drawChart(){
+  const cv=$('chart'),dpr=window.devicePixelRatio||1;
+  const w=cv.clientWidth,h=170;cv.width=w*dpr;cv.height=h*dpr;
+  const ctx=cv.getContext('2d');ctx.scale(dpr,dpr);ctx.clearRect(0,0,w,h);
+  ctx.strokeStyle='rgba(126,141,176,.15)';ctx.lineWidth=1;
+  for(let i=1;i<4;i++){ctx.beginPath();ctx.moveTo(0,h*i/4);ctx.lineTo(w,h*i/4);ctx.stroke();}
+  const n=hist.length;if(n<2)return;
+  const keys=['cpu','gpu','ram','vram','w'];
+  for(const k of keys){
+    ctx.strokeStyle=COLORS[k];ctx.lineWidth=k==='w'?1:1.6;ctx.beginPath();let started=false;
+    for(let i=0;i<n;i++){
+      let v=hist[i][k];if(v==null){started=false;continue;}
+      if(k==='w')v=Math.min(100,100*v/maxW);
+      const x=w*i/(299),y=h-4-(h-8)*Math.max(0,Math.min(100,v))/100;
+      if(!started){ctx.moveTo(x,y);started=true;}else ctx.lineTo(x,y);
+    }
+    ctx.stroke();
+  }
+}
+function update(s){
+  offline=false;
+  $('hHost').textContent=s.host.hostname;
+  $('hIp').textContent=s.host.ip||'--';
+  $('hOs').textContent=s.host.os;
+  $('cpuCount').textContent=(s.cpu.count||'')+' 线程';
+  $('cpuPct').textContent=pctTxt(s.cpu.pct);ring('cpuRing',s.cpu.pct,COLORS.cpu);
+  $('cpuFreq').textContent=s.cpu.freq_mhz?s.cpu.freq_mhz+' MHz':'--';
+  $('cpuTemp').textContent=s.cpu.temp_c!=null?s.cpu.temp_c+' °C':'--';
+  $('cpuW').textContent=s.cpu.power_w!=null?s.cpu.power_w+' W':'--';
+  $('cpuLoad').textContent=s.system.load?s.system.load.map(x=>x.toFixed(2)).join(' / '):'--';
+  const cores=s.cpu.cores||[];const cEl=$('cores');
+  if(cores.length){if(cEl.children.length!==cores.length){cEl.innerHTML=cores.map(()=>'<i></i>').join('');}
+    [...cEl.children].forEach((el,i)=>el.style.height=Math.max(4,cores[i])+'%');
+    $('coresNote').textContent='每核占用（'+cores.length+' 核）';
+  }else{cEl.innerHTML='';$('coresNote').textContent='';}
+  $('gpuVendor').textContent=(s.gpu.vendor||'').toUpperCase();
+  $('gpuName').textContent=s.gpu.name||'--';
+  $('gpuPct').textContent=pctTxt(s.gpu.util);ring('gpuRing',s.gpu.util,COLORS.gpu);
+  $('gpuClk').textContent=s.gpu.clock_mhz?s.gpu.clock_mhz+' MHz':'--';
+  $('gpuTemp').textContent=s.gpu.temp_c!=null?s.gpu.temp_c+' °C':'--';
+  $('gpuW').textContent=s.gpu.power_w!=null?s.gpu.power_w+' W':'--';
+  $('gpuFan').textContent=s.gpu.fan_pct!=null?Math.round(s.gpu.fan_pct)+'%':'--';
+  $('gpuMemTxt').textContent=fmtB(s.gpu.vram_used)+' / '+fmtB(s.gpu.vram_total);
+  $('gpuMemBar').style.width=(s.gpu.vram_pct||0)+'%';
+  $('ramPct').textContent=pctTxt(s.ram.pct);ring('ramRing',s.ram.pct,COLORS.ram);
+  $('ramTxt').textContent=fmtB(s.ram.used)+' / '+fmtB(s.ram.total);
+  $('vramPct').textContent=pctTxt(s.gpu.vram_pct);ring('vramRing',s.gpu.vram_pct,COLORS.vram);
+  $('vramTxt').textContent=fmtB(s.gpu.vram_used)+' / '+fmtB(s.gpu.vram_total);
+  $('totW').textContent=s.power.total_w!=null?s.power.total_w:'--';
+  $('pGpu').textContent=s.power.gpu_w!=null?s.power.gpu_w+' W':'--';
+  $('pCpu').textContent=s.power.cpu_w!=null?s.power.cpu_w+' W':'--';
+  $('pNote').textContent=s.power.note||'';
+  if(s.power.total_w)maxW=Math.max(maxW,s.power.total_w*1.15);
+  $('sysUp').textContent=fmtDur(s.system.uptime_s);
+  $('sysProcs').textContent=s.system.procs!=null?s.system.procs:'--';
+  $('sysPort').textContent=s.assistant.port;
+  $('sysPy').textContent=s.host.python;
+  const d=s.disk||{};
+  $('diskPath').textContent=d.path||'--';
+  $('diskTotal').textContent=fmtB(d.total);$('diskFree').textContent=fmtB(d.free);
+  $('diskR').textContent=fmtRate(d.read_bps);$('diskW').textContent=fmtRate(d.write_bps);
+  $('diskBar').style.width=(d.pct||0)+'%';$('diskPct').textContent=d.pct!=null?'已用 '+d.pct+'%':'';
+  $('netRx').textContent=fmtRate((s.net||{}).rx_bps);$('netTx').textContent=fmtRate((s.net||{}).tx_bps);
+  $('netComfy').textContent=s.comfyui.url;
+  $('netVer').textContent='v'+s.assistant.version;
+  $('panelUrl').textContent='http://'+(s.host.ip||'<本机IP>')+':'+s.assistant.port+'/api/panel';
+  const c=s.comfyui;
+  const stMap={running:['运行中','on'],starting:['启动中','mid'],stopped:['已停止','off'],external:['外部运行','mid']};
+  const [stxt,dcls]=stMap[c.state]||['未知',''];
+  $('comfyState').textContent=stxt;$('comfyDot').className='dot '+dcls;
+  $('comfyVer').textContent=c.version||'--';
+  $('comfyTorch').textContent=c.pytorch||'--';
+  $('comfyDev').textContent=c.device_name||'--';
+  $('comfyPid').textContent=c.pid?(c.pid+(c.managed?'（助手管理）':'（外部）')):'--';
+  $('comfyRun').textContent=c.running;$('comfyPend').textContent=c.pending;
+  $('comfyDur').textContent=c.job_start_ms?fmtMS(Date.now()-c.job_start_ms):'--';
+  $('btnStart').disabled=(c.state==='running'||c.state==='starting'||c.state==='external');
+  $('btnStop').disabled=(c.state==='stopped');
+  const [rn,hot]=realmOf(s.gpu.util,c.state==='running'||c.state==='external');
+  $('realm').textContent=rn+'境';$('realm').className='realm serif'+(hot?' hot':'');
+  if(s.assistant.session_warning){$('warn').style.display='block';$('warn').textContent='⚠ '+s.assistant.session_warning;}
+  hist.push({cpu:s.cpu.pct,gpu:s.gpu.util,ram:s.ram.pct,vram:s.gpu.vram_pct,w:s.power.total_w});
+  if(hist.length>300)hist.shift();
+  drawChart();
+}
+async function poll(){
+  try{
+    const r=await fetch('/api/status');const s=await r.json();update(s);
+  }catch(e){
+    if(!offline){offline=true;$('realm').textContent='失联';$('comfyState').textContent='助手失联';$('comfyDot').className='dot off';}
+  }
+}
+async function pollLogs(){
+  try{const r=await fetch('/api/logs');const j=await r.json();
+    if(j.lines.length){const el=$('logs');const stick=el.scrollTop+el.clientHeight>=el.scrollHeight-30;
+      el.textContent=j.lines.join('\n');if(stick)el.scrollTop=el.scrollHeight;
+      $('logTag').textContent=j.lines.length+' 行';}
+  }catch(e){}
+}
+async function loadCfg(){
+  try{const r=await fetch('/api/config');const c=await r.json();
+    $('cfgUrl').value=c.comfy_url||'';$('cfgDir').value=c.workdir||'';$('cfgCmd').value=c.start_cmd||'';
+  }catch(e){}
+}
+async function act(path,msgEl){
+  msgEl.textContent='发起中…';
+  try{const r=await fetch(path,{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});
+    const j=await r.json();msgEl.textContent=j.msg||'';poll();
+  }catch(e){msgEl.textContent='请求失败：助手不可达';}
+}
+$('btnStart').onclick=()=>act('/api/comfy/start',$('comfyMsg'));
+$('btnStop').onclick=()=>{if(confirm('确定停止 ComfyUI？正在生成的任务会被中断。'))act('/api/comfy/stop',$('comfyMsg'));};
+$('btnSave').onclick=async()=>{
+  const body={comfy_url:$('cfgUrl').value.trim(),workdir:$('cfgDir').value.trim(),start_cmd:$('cfgCmd').value.trim()};
+  try{const r=await fetch('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+    const j=await r.json();$('cfgMsg').textContent=j.ok?'已保存':'保存失败：'+(j.msg||'');
+  }catch(e){$('cfgMsg').textContent='保存失败：助手不可达';}
+};
+setInterval(()=>{$('hClock').textContent=new Date().toLocaleTimeString('zh-CN',{hour12:false});},1000);
+setInterval(poll,1000);setInterval(pollLogs,2000);
+window.addEventListener('resize',drawChart);
+(async()=>{try{const r=await fetch('/api/history');const j=await r.json();hist=j.points||[];}catch(e){}
+  loadCfg();poll();pollLogs();})();
+</script>
+</body>
+</html>

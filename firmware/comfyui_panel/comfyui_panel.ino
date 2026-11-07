@@ -26,6 +26,7 @@
 #include <stdarg.h>
 #include <JPEGDEC.h>
 #include "cn_fonts.h"
+#include "gpu_logos.h"
 
 // ---------- pins ----------
 #define LCD_SCK 5
@@ -40,13 +41,14 @@
 #define GFX_ROT 1
 #define TOUCH_MAP 0
 #define DEFAULT_PORT 8188
-#define MAX_HOSTS 3
+#define MAX_HOSTS 4
 #define MAX_JOBS 4
 #define LOG_LINES 10
 #define LCD_SPI_HZ 80000000
 #define THUMB_W 100
 #define THUMB_H 84
 #define THUMB_JPEG_MAX (384 * 1024)
+#define OFFLINE_MS 10000  // no successful API response for this long => offline
 
 TCA9554 TCA(0x20);
 TouchDrvFT6X36 touch;
@@ -65,6 +67,8 @@ String cfgSsid, cfgPsk;
 String hostStr[MAX_HOSTS];
 int hostPort[MAX_HOSTS];
 int nHosts = 0;
+bool ultraEnabled = false;      // Ultra overview fed by the on-host assistant
+int ultraPort = 8189;           // assistant port A (same on every host)
 volatile int activeHost = 0;
 volatile int activePage = 0;  // 0 monitor, 1 outputs
 volatile int activePageIdx = 0;
@@ -79,7 +83,10 @@ struct Vitals {
   double ram_total = 0, ram_free = 0;
   double vram_total = 0, vram_free = 0;
   char gpu_name[48] = "";
+  char gpu[24] = "";        // short model, e.g. "RTX 5070" / "RX 7900 XT"
+  uint8_t gpuVendor = 0;    // 0 unknown, 1 NVIDIA, 2 AMD
   char version[12] = "";
+  char accel[20] = "";    // "ROCm 10.1.0" / "CUDA 12.8" ... from the pytorch build tag
 };
 struct Run {
   bool connected = false;
@@ -88,6 +95,18 @@ struct Run {
   char node[16] = "";
   float pv = 0, pmax = 0, stepSec = 0;
   uint32_t start_ms = 0;
+};
+// Ultra: hardware vitals from the on-host "看板助手" (/api/panel on port A).
+// Percent fields are -1 when unknown; watts < 0 when unreadable.
+struct Ultra {
+  bool ok = false;          // assistant answered recently
+  bool everSeen = false;
+  uint32_t lastSeen = 0;
+  int cpu = -1, gpu = -1, ram = -1, vram = -1;
+  float watts = -1;
+  float gpuTemp = -1, cpuTemp = -1;
+  char gpuName[48] = "";
+  uint8_t gpuVendor = 0;    // 0 unknown, 1 NVIDIA, 2 AMD
 };
 struct Job {
   char file[56] = "";
@@ -108,10 +127,12 @@ struct NetData {
   int port = DEFAULT_PORT;
   Vitals vitals;
   Run run;
+  Ultra ultra;
   Job jobs[MAX_JOBS];
   int nJobs = 0;
   bool serverOk = false;
-  uint32_t lastPollOk = 0;
+  bool everSeen = false;    // got at least one successful response since boot
+  uint32_t lastSeen = 0;    // millis of last successful API response
   uint32_t ver = 0;
   char logLines[LOG_LINES][52] = {{0}};
   int logCount = 0;
@@ -133,7 +154,7 @@ struct NetData {
   uint32_t lastStepMs = 0;
   uint32_t lastStepLog = 0;
   uint32_t lastHeartbeat = 0;
-  uint32_t tV = 0, tQ = 0, tH = 0;
+  uint32_t tV = 0, tQ = 0, tH = 0, tU = 0;
 };
 NetData net[MAX_HOSTS];
 SemaphoreHandle_t netMux = nullptr;
@@ -146,20 +167,24 @@ uint8_t *thumbJpg = nullptr;
 // ---------- UI-side copies ----------
 Vitals vitals;
 Run run;
+Ultra ultra;
 Job jobs[MAX_JOBS];
 int nJobs = 0;
-bool serverOk = false;
+bool serverOk = false, everSeen = false;
 int nodeTotal = 0, nodesDone = 0, nodesCached = 0;
-uint32_t lastVer[MAX_HOSTS] = {0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu};
-uint32_t lastLogVer[MAX_HOSTS] = {0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu};
+struct HostView {
+  Vitals vitals; Run run; Ultra ultra; Job jobs[MAX_JOBS]; int nJobs = 0;
+  bool serverOk = false, everSeen = false;
+  int nodeTotal = 0, nodesDone = 0, nodesCached = 0;
+};
+
+uint32_t lastVer[MAX_HOSTS] = {0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu};
+uint32_t lastLogVer[MAX_HOSTS] = {0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu};
 uint32_t lastThumbVer[MAX_HOSTS][MAX_JOBS] = {{0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu},
+                                              {0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu},
                                               {0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu},
                                               {0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu}};
 
-WebSocketsClient wsClient;
-bool wsStarted = false;
-char wsClientId[40] = "esp32panel";
-uint32_t lastWsRebind = 0;
 uint32_t uiMaxUs = 0;
 
 // ---------- UI themes ----------
@@ -173,7 +198,7 @@ static const char *THEME_ZH[10] = {"深空玻璃","极简白","赛博霓虹","�
 static const Theme THEMES[10] = {
   {"Dark Glass",   0x0d1220,0x111a2e,0x18203a,0x101828,0x4f8cff,0x2ecc71,0xf5a623,0xe5484d,0xdfe7f5,0x8494ad,0x223154, 8,false},
   {"Minimal Light",0xf4f5f7,0xffffff,0xffffff,0xf8f9fb,0x151a22,0x16a34a,0xd97706,0xdc2626,0x151a22,0x7b8496,0xdfe3ea,14,true},
-  {"Cyber Neon",   0x08060f,0x0c0818,0x120c22,0x180e2c,0x00f0ff,0xff2d95,0xffd60a,0xff3b30,0xf5f0ff,0x9682be,0xff2d95, 2,false},
+  {"Cyber Neon",   0x08060f,0x0c0818,0x120c22,0x180e2c,0x00f0ff,0xff2d95,0xffd60a,0xff3b30,0xf5f0ff,0x9682be,0x3d1230, 2,false},
   {"Terminal",     0x020a04,0x020a04,0x021406,0x021406,0x39ff14,0x39ff14,0xa6ff00,0xff4d4d,0x39ff14,0x1e8c28,0x14501e, 0,false},
   {"Industrial",   0x1b1f24,0x14181c,0x262c33,0x1e2328,0xff9f1c,0x33cccc,0xff9f1c,0xff5757,0xe8edf2,0x96a0aa,0x3a424b, 2,false},
   {"Synthwave",    0x2b1055,0x1a0c2c,0x2e1656,0x241244,0xff4ecd,0x00e5ff,0xffd166,0xff5c8a,0xfff0ff,0xbea0de,0x6a3a9a, 4,false},
@@ -184,7 +209,16 @@ static const Theme THEMES[10] = {
 };
 int themeIdx = 0;
 int lang = 0;  // 0 EN, 1 ZH
-bool dualMode = false;
+// The page layout follows the number of configured servers:
+// 1 -> detail + outputs, 2 -> 2 columns, 3 -> 3 columns, 4 -> 2x2 grid.
+static inline bool useGrid() { return nHosts >= 2; }
+static inline int gridCols() { return nHosts >= 4 ? 2 : (nHosts < 2 ? 1 : nHosts); }
+static inline int gridRows() { return nHosts >= 4 ? 2 : 1; }
+static inline int pageCount() { return useGrid() ? 3 : 2; }
+static inline int cellJobs() { return nHosts == 2 ? 2 : 1; }
+static inline uint32_t pollVitalsMs() { return nHosts >= 4 ? 5000 : (nHosts == 3 ? 4000 : 3000); }
+static inline uint32_t pollQueueMs() { return nHosts >= 4 ? 3500 : (nHosts == 3 ? 3000 : 2000); }
+static inline uint32_t offlineMs() { return nHosts >= 4 ? 20000 : (nHosts == 3 ? 15000 : OFFLINE_MS); }
 Theme TH;
 #define L(en, zh) (lang ? (zh) : (en))
 #define C_BG lv_color_hex(TH.bg)
@@ -202,6 +236,7 @@ Theme TH;
 
 lv_obj_t *scrSetup, *scrDash;
 lv_obj_t *wifiPanel, *srvPanel, *themePanel, *apList, *lblWifiState, *lblSrvVal[MAX_HOSTS], *lblScanStatus;
+lv_obj_t *btnUltraToggle, *lblUltraToggle, *btnUltraPort, *lblUltraPort;
 lv_obj_t *editOverlay, *editTitle, *editTa, *editKb;
 int editTarget = -1;
 String pendingSsid;
@@ -214,8 +249,12 @@ struct MonUI {
   lv_obj_t *lblState = nullptr, *lblDur = nullptr, *lblNode = nullptr, *lblQueue = nullptr;
   lv_obj_t *barProg = nullptr, *lblStep = nullptr, *spinner = nullptr, *lblHint = nullptr;
   lv_obj_t *gBar[2] = {nullptr, nullptr}, *gVal[2] = {nullptr, nullptr};
-  lv_obj_t *lblGpu = nullptr, *lblVer = nullptr;
+  lv_obj_t *lblGpu = nullptr, *imgGpu = nullptr, *lblAcc = nullptr, *lblVer = nullptr;
   lv_obj_t *logLabel = nullptr;
+  lv_obj_t *uLbl[4] = {nullptr, nullptr, nullptr, nullptr};
+  lv_obj_t *uVal[4] = {nullptr, nullptr, nullptr, nullptr};
+  lv_obj_t *uBar[4] = {nullptr, nullptr, nullptr, nullptr};
+  lv_obj_t *uPower = nullptr;
 };
 struct OutUI {
   lv_obj_t *canvas[MAX_JOBS] = {nullptr, nullptr, nullptr, nullptr};
@@ -226,29 +265,46 @@ struct OutUI {
 MonUI mui[MAX_HOSTS];
 OutUI oui[MAX_HOSTS];
 
-struct HostView {
-  Vitals vitals; Run run; Job jobs[MAX_JOBS]; int nJobs = 0;
-  bool serverOk = false; int nodeTotal = 0, nodesDone = 0, nodesCached = 0;
+HostView dview[MAX_HOSTS];
+uint32_t dviewVer[MAX_HOSTS] = {0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu};
+uint32_t dviewLogVer[MAX_HOSTS] = {0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu};
+uint32_t dviewThumbVer[MAX_HOSTS][MAX_JOBS] = {{0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu},
+                                               {0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu},
+                                               {0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu},
+                                               {0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu}};
+// widgets of the auto grid (used for 2/3/4 hosts)
+struct DashCell {
+  lv_obj_t *title = nullptr, *state = nullptr, *dur = nullptr, *node = nullptr, *step = nullptr, *bar = nullptr;
+  lv_obj_t *vramVal = nullptr, *vbar = nullptr, *ramVal = nullptr, *rbar = nullptr;
+  lv_obj_t *gpu = nullptr, *img = nullptr, *acc = nullptr, *ver = nullptr, *queue = nullptr;
 };
-HostView dview[2];
-uint32_t dviewVer[2] = {0xFFFFFFFFu, 0xFFFFFFFFu};
-uint32_t dviewLogVer[2] = {0xFFFFFFFFu, 0xFFFFFFFFu};
-uint32_t dviewThumbVer[2][MAX_JOBS] = {{0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu},
-                                       {0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu}};
-struct DualUI {
-  lv_obj_t *title[2] = {nullptr, nullptr};
-  lv_obj_t *state[2] = {nullptr, nullptr}, *dur[2] = {nullptr, nullptr};
-  lv_obj_t *node[2] = {nullptr, nullptr}, *step[2] = {nullptr, nullptr}, *bar[2] = {nullptr, nullptr};
-  lv_obj_t *vramVal[2] = {nullptr, nullptr}, *ramVal[2] = {nullptr, nullptr};
-  lv_obj_t *vbar[2] = {nullptr, nullptr}, *rbar[2] = {nullptr, nullptr};
-  lv_obj_t *gpu[2] = {nullptr, nullptr}, *ver[2] = {nullptr, nullptr}, *queue[2] = {nullptr, nullptr};
-  lv_obj_t *logLabel[2] = {nullptr, nullptr}, *logState[2] = {nullptr, nullptr};
-  lv_obj_t *outCv[2][2] = {{nullptr, nullptr}, {nullptr, nullptr}};
-  lv_obj_t *outName[2][2] = {{nullptr, nullptr}, {nullptr, nullptr}};
-  lv_obj_t *outMeta[2][2] = {{nullptr, nullptr}, {nullptr, nullptr}};
-  lv_obj_t *outPh[2][2] = {{nullptr, nullptr}, {nullptr, nullptr}};
+struct LogCell {
+  lv_obj_t *title = nullptr, *state = nullptr, *log = nullptr;
+  int lines = 0;
 };
-DualUI dui;
+struct OutCell {
+  lv_obj_t *title = nullptr;
+  lv_obj_t *cv[MAX_JOBS] = {nullptr, nullptr, nullptr, nullptr};
+  lv_obj_t *name[MAX_JOBS] = {nullptr, nullptr, nullptr, nullptr};
+  lv_obj_t *meta[MAX_JOBS] = {nullptr, nullptr, nullptr, nullptr};
+  lv_obj_t *ph[MAX_JOBS] = {nullptr, nullptr, nullptr, nullptr};
+  int jobs = 1;
+};
+DashCell gdash[MAX_HOSTS];
+LogCell glog[MAX_HOSTS];
+OutCell gout[MAX_HOSTS];
+
+// Ultra overview cell: base run info + CPU/GPU/RAM/VRAM utilization + power.
+struct UltraCell {
+  lv_obj_t *title = nullptr, *state = nullptr, *dur = nullptr, *node = nullptr,
+           *step = nullptr, *bar = nullptr, *gpu = nullptr, *img = nullptr,
+           *power = nullptr, *queue = nullptr;
+  lv_obj_t *mLbl[4] = {nullptr, nullptr, nullptr, nullptr};
+  lv_obj_t *mVal[4] = {nullptr, nullptr, nullptr, nullptr};
+  lv_obj_t *mBar[4] = {nullptr, nullptr, nullptr, nullptr};
+  bool compact = false;
+};
+UltraCell ucell[MAX_HOSTS];
 
 // ================= helpers =================
 static void setLbl(lv_obj_t *l, const char *txt) {
@@ -257,11 +313,17 @@ static void setLbl(lv_obj_t *l, const char *txt) {
   if (!cur || strcmp(cur, txt)) lv_label_set_text(l, txt);
 }
 static void setBar(lv_obj_t *bar, int v, lv_color_t col, lv_obj_t *val, const char *txt) {
-  if (!bar) return;
-  if (v < 0) v = 0; if (v > 100) v = 100;
-  if (lv_bar_get_value(bar) != v) lv_bar_set_value(bar, v, LV_ANIM_OFF);
-  lv_obj_set_style_bg_color(bar, col, LV_PART_INDICATOR);
+  if (bar) {
+    if (v < 0) v = 0; if (v > 100) v = 100;
+    if (lv_bar_get_value(bar) != v) lv_bar_set_value(bar, v, LV_ANIM_OFF);
+    lv_obj_set_style_bg_color(bar, col, LV_PART_INDICATOR);
+  }
   setLbl(val, txt);
+}
+static void setGpuMark(lv_obj_t *img, uint8_t vendor) {
+  if (!img) return;
+  const void *src = vendor == 1 ? (const void *)&GPU_LOGO_NVIDIA : (vendor == 2 ? (const void *)&GPU_LOGO_AMD : nullptr);
+  lv_img_set_src(img, src);
 }
 static lv_obj_t *mkCard(lv_obj_t *parent, int x, int y, int w, int h, lv_color_t bg = C_CARD) {
   lv_obj_t *c = lv_obj_create(parent);
@@ -342,6 +404,20 @@ void handleShot() {
 static inline void lockNet() { if (netMux) xSemaphoreTake(netMux, portMAX_DELAY); }
 static inline void unlockNet() { if (netMux) xSemaphoreGive(netMux); }
 static void bump(NetData &nd) { nd.ver++; }
+static void markSeenLocked(NetData &nd) { nd.serverOk = true; nd.everSeen = true; nd.lastSeen = millis(); }
+// goes online->offline once no successful response arrived for OFFLINE_MS; caller holds lock
+static bool markOfflineLocked(NetData &nd, uint32_t now) {
+  if (!nd.serverOk || now - nd.lastSeen <= offlineMs()) return false;
+  nd.serverOk = false;
+  nd.vitals = Vitals();
+  nd.run = Run();
+  nd.nodeTotal = nd.nodesDone = nd.nodesCached = 0;
+  nd.promptClient[0] = 0;
+  bump(nd);
+  return true;
+}
+// never answered yet: stay "connecting" for a grace period, then call it offline
+static inline bool stillLinking(bool seen) { return !seen && millis() < 15000; }
 static void addLogLocked(NetData &nd, const char *msg) {
   char line[52];
   time_t now = time(nullptr);
@@ -400,11 +476,13 @@ void loadCfg() {
   }
   themeIdx = prefs.getInt("theme", 0);
   lang = prefs.getInt("lang", 0);
-  dualMode = prefs.getBool("dual", false);
   if (lang < 0 || lang > 1) lang = 0;
+  ultraEnabled = prefs.getBool("ultra", false);
+  ultraPort = prefs.getInt("ultraPort", 8189);
+  if (ultraPort <= 0 || ultraPort > 65535) ultraPort = 8189;
   prefs.end();
   if (themeIdx < 0 || themeIdx > 9) themeIdx = 0;
-  Serial.printf("cfg ssid='%s' hosts=%d theme=%d dual=%d", cfgSsid.c_str(), nHosts, themeIdx, (int)dualMode);
+  Serial.printf("cfg ssid='%s' hosts=%d theme=%d layout=%dx%d", cfgSsid.c_str(), nHosts, themeIdx, gridCols(), gridRows());
   for (int i = 0; i < nHosts; i++) Serial.printf(" [%s:%d]", hostStr[i].c_str(), hostPort[i]);
   Serial.println();
 }
@@ -419,6 +497,9 @@ void saveCfg() {
   }
   prefs.remove("host");
   prefs.remove("port");
+  prefs.remove("dual");
+  prefs.putBool("ultra", ultraEnabled);
+  prefs.putInt("ultraPort", ultraPort);
   prefs.end();
 }
 void netConfigure() {
@@ -432,6 +513,19 @@ void netConfigure() {
   netActive = activeHost;
   netEpoch++;
   unlockNet();
+}
+
+// Persist a changed host list, rebuild the dashboard for the new host count and
+// stay on it (the layout follows nHosts).
+static void applyHostsAndShow() {
+  saveCfg();
+  netConfigure();
+  if (nHosts > 0 && wst == W_ONLINE) {
+    activeHost = 0; activePage = 0; activePageIdx = 0;
+    buildDashboard();
+    if (scrDash) lv_scr_load(scrDash);
+    netEpoch++;
+  } else if (scrSetup) showSetupTab(1);
 }
 
 // ================= setup UI =================
@@ -632,14 +726,14 @@ void buildSetup() {
 
   mkLabel(srvPanel, L("ComfyUI servers (ip:port, leave empty to disable)", "ComfyUI 服务器（ip:端口，留空停用）"), C_MUT, 10, 2, 12);
   for (int i = 0; i < MAX_HOSTS; i++) {
-    lv_obj_t *row = mkCard(srvPanel, 8, 26 + i * 62, 464, 56, C_CARD);
+    lv_obj_t *row = mkCard(srvPanel, 8, 20 + i * 40, 464, 38, C_CARD);
     char cap[24];
     snprintf(cap, sizeof(cap), L("Server %d", "服务器 %d"), i + 1);
-    mkLabel(row, cap, C_MUT, 2, 2, 12);
+    mkLabel(row, cap, C_MUT, 2, 1, 12);
     lblSrvVal[i] = mkLabel(row, hostStr[i].length() ? (hostStr[i] + ":" + String(hostPort[i])).c_str() : L("(unused)", "（未使用）"),
-                           hostStr[i].length() ? C_TXT : C_MUT, 2, 20, 14);
+                           hostStr[i].length() ? C_TXT : C_MUT, 2, 17, 14);
     lv_obj_t *eb = lv_btn_create(row);
-    lv_obj_set_size(eb, 64, 28);
+    lv_obj_set_size(eb, 60, 26);
     lv_obj_align(eb, LV_ALIGN_RIGHT_MID, 0, 0);
     lv_obj_set_style_bg_color(eb, C_INNER, 0);
     lv_obj_set_style_shadow_width(eb, 0, 0);
@@ -657,10 +751,53 @@ void buildSetup() {
     }, LV_EVENT_CLICKED, NULL);
   }
 
-  mkLabel(srvPanel, L("Language", "语言"), C_MUT, 10, 228, 12);
+  // Ultra mode: hardware vitals from the on-host assistant (port A)
+  btnUltraToggle = lv_btn_create(srvPanel);
+  lv_obj_set_size(btnUltraToggle, 120, 26);
+  lv_obj_set_pos(btnUltraToggle, 8, 182);
+  lv_obj_set_style_bg_color(btnUltraToggle, ultraEnabled ? C_ACCENT : C_INNER, 0);
+  lv_obj_set_style_shadow_width(btnUltraToggle, 0, 0);
+  lblUltraToggle = lv_label_create(btnUltraToggle);
+  lv_label_set_text(lblUltraToggle, ultraEnabled ? L("Ultra: ON", "Ultra：开") : L("Ultra: OFF", "Ultra：关"));
+  lv_obj_set_style_text_font(lblUltraToggle, &cn_font_14, 0);
+  lv_obj_center(lblUltraToggle);
+  lv_obj_add_event_cb(btnUltraToggle, [](lv_event_t *) {
+    ultraEnabled = !ultraEnabled;
+    saveCfg();
+    lv_label_set_text(lblUltraToggle, ultraEnabled ? L("Ultra: ON", "Ultra：开") : L("Ultra: OFF", "Ultra：关"));
+    lv_obj_set_style_bg_color(btnUltraToggle, ultraEnabled ? C_ACCENT : C_INNER, 0);
+    if (nHosts > 0 && wst == W_ONLINE) {
+      buildDashboard();
+      lv_scr_load(scrDash);
+      netEpoch++;
+    }
+  }, LV_EVENT_CLICKED, NULL);
+
+  btnUltraPort = lv_btn_create(srvPanel);
+  lv_obj_set_size(btnUltraPort, 130, 26);
+  lv_obj_set_pos(btnUltraPort, 136, 182);
+  lv_obj_set_style_bg_color(btnUltraPort, C_INNER, 0);
+  lv_obj_set_style_shadow_width(btnUltraPort, 0, 0);
+  lblUltraPort = lv_label_create(btnUltraPort);
+  char up[32];
+  snprintf(up, sizeof(up), L("Port A: %d", "端口 A：%d"), ultraPort);
+  lv_label_set_text(lblUltraPort, up);
+  lv_obj_set_style_text_font(lblUltraPort, &cn_font_14, 0);
+  lv_obj_center(lblUltraPort);
+  lv_obj_add_event_cb(btnUltraPort, [](lv_event_t *) {
+    char cur[12];
+    snprintf(cur, sizeof(cur), "%d", ultraPort);
+    openEditor(10, L("Assistant port A", "看板助手端口 A"), cur, false);
+  }, LV_EVENT_CLICKED, NULL);
+  lv_obj_t *ultraHint = mkLabel(srvPanel, L("Ultra overview adds CPU/GPU/RAM/VRAM load + power from the assistant.",
+                      "Ultra 总览由看板助手补充 CPU/GPU/内存/显存占用与功耗。"), C_MUT, 274, 178, 12);
+  lv_obj_set_width(ultraHint, 198);
+  lv_label_set_long_mode(ultraHint, LV_LABEL_LONG_WRAP);
+
+  mkLabel(srvPanel, L("Language", "语言"), C_MUT, 10, 212, 12);
   lv_obj_t *lbEn = lv_btn_create(srvPanel);
   lv_obj_set_size(lbEn, 52, 26);
-  lv_obj_set_pos(lbEn, 10, 246);
+  lv_obj_set_pos(lbEn, 10, 230);
   lv_obj_set_style_bg_color(lbEn, lang == 0 ? C_ACCENT : C_INNER, 0);
   lv_obj_set_style_shadow_width(lbEn, 0, 0);
   lv_obj_t *le = lv_label_create(lbEn);
@@ -673,7 +810,7 @@ void buildSetup() {
   }, LV_EVENT_CLICKED, NULL);
   lv_obj_t *lbZh = lv_btn_create(srvPanel);
   lv_obj_set_size(lbZh, 52, 26);
-  lv_obj_set_pos(lbZh, 68, 246);
+  lv_obj_set_pos(lbZh, 68, 230);
   lv_obj_set_style_bg_color(lbZh, lang == 1 ? C_ACCENT : C_INNER, 0);
   lv_obj_set_style_shadow_width(lbZh, 0, 0);
   lv_obj_t *lz = lv_label_create(lbZh);
@@ -695,8 +832,14 @@ void buildSetup() {
   lv_obj_set_style_text_font(okl, &cn_font_14, 0);
   lv_obj_center(okl);
   lv_obj_add_event_cb(okBtn, [](lv_event_t *) {
-    nHosts = 0;
-    for (int i = 0; i < MAX_HOSTS; i++) if (hostStr[i].length()) nHosts = i + 1;
+    int cnt = 0;
+    for (int i = 0; i < MAX_HOSTS; i++) {
+      if (!hostStr[i].length()) continue;
+      if (cnt != i) { hostStr[cnt] = hostStr[i]; hostPort[cnt] = hostPort[i]; }
+      cnt++;
+    }
+    for (int i = cnt; i < MAX_HOSTS; i++) { hostStr[i] = ""; hostPort[i] = DEFAULT_PORT; }
+    nHosts = cnt;
     saveCfg();
     netConfigure();
     if (nHosts > 0 && wst == W_ONLINE) {
@@ -716,34 +859,20 @@ void buildSetup() {
   lv_obj_clear_flag(themePanel, LV_OBJ_FLAG_SCROLLABLE);
   lv_obj_add_flag(themePanel, LV_OBJ_FLAG_HIDDEN);
 
-  mkLabel(themePanel, L("Framework", "布局"), C_MUT, 10, 2, 12);
-  lv_obj_t *fbSingle = lv_btn_create(themePanel);
-  lv_obj_set_size(fbSingle, 120, 30);
-  lv_obj_set_pos(fbSingle, 10, 18);
-  lv_obj_set_style_bg_color(fbSingle, dualMode ? C_CARD : C_ACCENT, 0);
-  lv_obj_set_style_shadow_width(fbSingle, 0, 0);
-  lv_obj_t *fl1 = lv_label_create(fbSingle);
-  lv_label_set_text(fl1, L("Single host", "单机"));
-  lv_obj_set_style_text_font(fl1, &cn_font_14, 0);
-  lv_obj_center(fl1);
-  lv_obj_add_event_cb(fbSingle, [](lv_event_t *) {
-    prefs.begin("cfg", false); prefs.putBool("dual", false); prefs.end();
-    delay(120); ESP.restart();
-  }, LV_EVENT_CLICKED, NULL);
-  lv_obj_t *fbDual = lv_btn_create(themePanel);
-  lv_obj_set_size(fbDual, 120, 30);
-  lv_obj_set_pos(fbDual, 138, 18);
-  lv_obj_set_style_bg_color(fbDual, dualMode ? C_ACCENT : C_CARD, 0);
-  lv_obj_set_style_shadow_width(fbDual, 0, 0);
-  lv_obj_t *fl2 = lv_label_create(fbDual);
-  lv_label_set_text(fl2, L("Dual host", "双机"));
-  lv_obj_set_style_text_font(fl2, &cn_font_14, 0);
-  lv_obj_center(fl2);
-  lv_obj_add_event_cb(fbDual, [](lv_event_t *) {
-    prefs.begin("cfg", false); prefs.putBool("dual", true); prefs.end();
-    delay(120); ESP.restart();
-  }, LV_EVENT_CLICKED, NULL);
-  mkLabel(themePanel, L("Theme (tap to apply, reboots)", "主题（点选应用并重启）"), C_MUT, 10, 54, 12);
+  mkLabel(themePanel, L("Layout (auto, follows server count)", "布局（按服务器数量自动）"), C_MUT, 10, 2, 12);
+  char lay[72];
+  if (useGrid()) {
+    if (lang) snprintf(lay, sizeof(lay), "%d 台 → %d 列 × %d 行（总览 / 日志 / 产物）", nHosts, gridCols(), gridRows());
+    else snprintf(lay, sizeof(lay), "%d hosts -> %dx%d grid (OVERVIEW / LOGS / OUTPUTS)", nHosts, gridCols(), gridRows());
+  } else {
+    if (lang) snprintf(lay, sizeof(lay), "%d 台 → 详情页 + 产物页", nHosts);
+    else snprintf(lay, sizeof(lay), "%d host -> detail + outputs", nHosts);
+  }
+  lv_obj_t *layLbl = mkLabel(themePanel, lay, C_TXT, 10, 18, 14);
+  lv_obj_set_width(layLbl, 460);
+  lv_label_set_long_mode(layLbl, LV_LABEL_LONG_DOT);
+  mkLabel(themePanel, L("Add or clear servers on the Servers page.", "服务器数量在「服务器」页设置。"), C_MUT, 10, 38, 12);
+  mkLabel(themePanel, L("Theme (tap to apply, reboots)", "主题（点选应用并重启）"), C_MUT, 10, 56, 12);
   for (int i = 0; i < 10; i++) {
     int x = 8 + (i % 2) * 232;
     int y = 74 + (i / 2) * 38;
@@ -815,6 +944,19 @@ void buildSetup() {
       wifiTrySince = millis();
       wst = W_CONNECTING;
       updateWifiStatus();
+    } else if (editTarget == 10) {
+      int p = String(txt).toInt();
+      if (p > 0 && p <= 65535) {
+        ultraPort = p;
+        saveCfg();
+        char t[32];
+        snprintf(t, sizeof(t), L("Port A: %d", "端口 A：%d"), ultraPort);
+        lv_label_set_text(lblUltraPort, t);
+        lockNet();
+        for (int i = 0; i < MAX_HOSTS; i++) net[i].tU = 0;
+        unlockNet();
+        netEpoch++;
+      }
     } else if (editTarget >= 0 && editTarget < MAX_HOSTS) {
       parseHost(editTarget, String(txt));
       netConfigure();
@@ -846,9 +988,9 @@ void buildSetup() {
 
 // ================= dashboard =================
 void updatePageDots() {
-  int used = dualMode ? 3 : nHosts * 2;
+  int used = pageCount();
   const char *sub;
-  if (dualMode) sub = activePageIdx == 0 ? L("DASH", "总览") : (activePageIdx == 1 ? L("LOGS", "日志") : L("OUT", "产物"));
+  if (useGrid()) sub = activePageIdx == 0 ? L("OVERVIEW", "总览") : (activePageIdx == 1 ? L("LOGS", "日志") : L("OUT", "产物"));
   else sub = activePage ? L("OUT", "产物") : L("MON", "监控");
   setLbl(lblPageSub, sub);
 
@@ -880,11 +1022,15 @@ void updatePageDots() {
 }
 void refreshHeader() {
   if (!scrDash || !lblHost) return;
-  if (dualMode) {
-    setLbl(lblHost, L("DUAL 2 hosts", "双机 · 2 台"));
-    bool ok0 = (nHosts > 0) && dview[0].serverOk;
-    bool ok1 = (nHosts < 2) || dview[1].serverOk;
-    lv_obj_set_style_bg_color(dotServer, (wst == W_ONLINE && ok0 && ok1) ? C_OK : C_ERR, 0);
+  if (useGrid()) {
+    int on = 0;
+    for (int h = 0; h < nHosts && h < MAX_HOSTS; h++) if (dview[h].serverOk) on++;
+    char t[32];
+    if (lang) snprintf(t, sizeof(t), "%d/%d 台在线", on, nHosts);
+    else snprintf(t, sizeof(t), "%d/%d online", on, nHosts);
+    setLbl(lblHost, t);
+    lv_color_t dot = (on == 0) ? C_ERR : (on < nHosts ? C_WARN : C_OK);
+    lv_obj_set_style_bg_color(dotServer, (wst == W_ONLINE) ? dot : C_ERR, 0);
     updatePageDots();
     return;
   }
@@ -953,26 +1099,54 @@ static void buildMonitor(int idx, lv_obj_t *tile) {
   lv_label_set_long_mode(m.lblHint, LV_LABEL_LONG_DOT);
 
   lv_obj_t *gCard = mkCard(tile, 4, 84, 176, 198);
-  for (int i = 0; i < 2; i++) {
-    int y = 2 + i * 46;
-    mkLabel(gCard, i == 0 ? "VRAM" : "RAM", C_MUT, 4, y, 12);
-    m.gVal[i] = mkLabel(gCard, "--", C_TXT, 0, y, 12);
-    lv_obj_align(m.gVal[i], LV_ALIGN_TOP_RIGHT, -4, y);
-    m.gBar[i] = lv_bar_create(gCard);
-    lv_obj_set_size(m.gBar[i], 164, 12);
-    lv_obj_set_pos(m.gBar[i], 4, y + 20);
-    lv_bar_set_range(m.gBar[i], 0, 100);
-    lv_obj_set_style_bg_opa(m.gBar[i], LV_OPA_COVER, 0);
-    lv_obj_set_style_bg_color(m.gBar[i], lv_color_hex(0x1a2947), 0);
-    lv_obj_set_style_bg_color(m.gBar[i], C_ACCENT, LV_PART_INDICATOR);
-    lv_bar_set_value(m.gBar[i], 0, LV_ANIM_OFF);
+  if (ultraEnabled) {
+    static const char *MLBL[4] = {"CPU", "GPU", "RAM", "VRAM"};
+    for (int k = 0; k < 4; k++) {
+      int y = 2 + k * 30;
+      m.uLbl[k] = mkLabel(gCard, MLBL[k], C_MUT, 4, y, 12);
+      m.uVal[k] = mkLabel(gCard, "--", C_TXT, 0, y, 12);
+      lv_obj_align(m.uVal[k], LV_ALIGN_TOP_RIGHT, -4, y);
+      m.uBar[k] = mkBarIn(gCard, 4, y + 16, 164, 8, C_ACCENT);
+    }
+    m.uPower = mkLabel(gCard, "", C_WARN, 4, 124, 12);
+    lv_obj_set_width(m.uPower, 164);
+    lv_label_set_long_mode(m.uPower, LV_LABEL_LONG_DOT);
+    mkLabel(gCard, "GPU", C_MUT, 4, 146, 12);
+    m.imgGpu = lv_img_create(gCard);
+    lv_obj_set_pos(m.imgGpu, 34, 145);
+    m.lblGpu = mkLabel(gCard, "--", C_TXT, 54, 146, 12);
+    lv_obj_set_width(m.lblGpu, 114);
+    lv_label_set_long_mode(m.lblGpu, LV_LABEL_LONG_DOT);
+    m.lblVer = mkLabel(gCard, "ComfyUI --", C_MUT, 4, 166, 12);
+    lv_obj_set_width(m.lblVer, 164);
+    lv_label_set_long_mode(m.lblVer, LV_LABEL_LONG_DOT);
+  } else {
+    for (int i = 0; i < 2; i++) {
+      int y = 2 + i * 46;
+      mkLabel(gCard, i == 0 ? "VRAM" : "RAM", C_MUT, 4, y, 12);
+      m.gVal[i] = mkLabel(gCard, "--", C_TXT, 0, y, 12);
+      lv_obj_align(m.gVal[i], LV_ALIGN_TOP_RIGHT, -4, y);
+      m.gBar[i] = lv_bar_create(gCard);
+      lv_obj_set_size(m.gBar[i], 164, 12);
+      lv_obj_set_pos(m.gBar[i], 4, y + 20);
+      lv_bar_set_range(m.gBar[i], 0, 100);
+      lv_obj_set_style_bg_opa(m.gBar[i], LV_OPA_COVER, 0);
+      lv_obj_set_style_bg_color(m.gBar[i], lv_color_hex(0x1a2947), 0);
+      lv_obj_set_style_bg_color(m.gBar[i], C_ACCENT, LV_PART_INDICATOR);
+      lv_bar_set_value(m.gBar[i], 0, LV_ANIM_OFF);
+    }
+    mkLabel(gCard, "GPU", C_MUT, 4, 98, 12);
+    m.imgGpu = lv_img_create(gCard);
+    lv_obj_set_pos(m.imgGpu, 4, 111);
+    m.lblGpu = mkLabel(gCard, "--", C_TXT, 24, 112, 12);
+    lv_obj_set_width(m.lblGpu, 144);
+    lv_label_set_long_mode(m.lblGpu, LV_LABEL_LONG_DOT);
+    m.lblAcc = mkLabel(gCard, "", C_MUT, 4, 128, 12);
+    lv_obj_set_width(m.lblAcc, 164);
+    lv_label_set_long_mode(m.lblAcc, LV_LABEL_LONG_DOT);
+    m.lblVer = mkLabel(gCard, "ComfyUI --", C_MUT, 4, 148, 12);
+    mkLabel(gCard, L("swipe for outputs >", "右滑查看产物 >"), C_MUT, 4, 168, 12);
   }
-  mkLabel(gCard, "GPU", C_MUT, 4, 98, 12);
-  m.lblGpu = mkLabel(gCard, "--", C_TXT, 4, 112, 12);
-  lv_obj_set_width(m.lblGpu, 164);
-  lv_label_set_long_mode(m.lblGpu, LV_LABEL_LONG_DOT);
-  m.lblVer = mkLabel(gCard, "ComfyUI --", C_MUT, 4, 148, 12);
-  mkLabel(gCard, L("swipe for outputs >", "右滑查看产物 >"), C_MUT, 4, 168, 12);
 
   lv_obj_t *lCard = mkCard(tile, 186, 84, 290, 198);
   mkLabel(lCard, L("RUN LOG", "运行日志"), C_MUT, 8, 4, 12);
@@ -1028,16 +1202,18 @@ static void buildOutputs(int idx, lv_obj_t *tile) {
 }
 
 bool pullHost(int h) {
-  if (h < 0 || h >= nHosts || h >= 2) return false;
+  if (h < 0 || h >= nHosts || h >= MAX_HOSTS) return false;
   bool changed = false;
   lockNet();
   NetData &nd = net[h];
   if (nd.ver != dviewVer[h]) {
     dview[h].vitals = nd.vitals;
     dview[h].run = nd.run;
+    dview[h].ultra = nd.ultra;
     dview[h].nJobs = nd.nJobs;
     for (int i = 0; i < nd.nJobs && i < MAX_JOBS; i++) dview[h].jobs[i] = nd.jobs[i];
     dview[h].serverOk = nd.serverOk;
+    dview[h].everSeen = nd.everSeen;
     dview[h].nodeTotal = nd.nodeTotal;
     dview[h].nodesDone = nd.nodesDone;
     dview[h].nodesCached = nd.nodesCached;
@@ -1048,139 +1224,229 @@ bool pullHost(int h) {
   return changed;
 }
 
-static void dualDashColumn(int h, lv_obj_t *tile) {
-  int x = 4 + h * 240;
-  lv_obj_t *card = mkCard(tile, x, 4, 232, 278);
-  dui.title[h] = mkLabel(card, hostStr[h].length() ? hostStr[h].c_str() : "(unused)", C_MUT, 0, 0, 12);
-  lv_obj_set_width(dui.title[h], 220);
-  lv_label_set_long_mode(dui.title[h], LV_LABEL_LONG_DOT);
-  dui.state[h] = mkLabel(card, "--", C_ACCENT, 0, 16, 20);
-  dui.dur[h] = mkLabel(card, "00:00", C_TXT, 0, 16, 20);
-  lv_obj_align(dui.dur[h], LV_ALIGN_TOP_RIGHT, 0, 16);
-  dui.node[h] = mkLabel(card, "node -", C_MUT, 0, 48, 12);
-  dui.step[h] = mkLabel(card, "", C_TXT, 0, 48, 12);
-  lv_obj_align(dui.step[h], LV_ALIGN_TOP_RIGHT, 0, 48);
-  dui.bar[h] = lv_bar_create(card);
-  lv_obj_set_size(dui.bar[h], 220, 10);
-  lv_obj_set_pos(dui.bar[h], 0, 66);
-  lv_obj_set_style_bg_opa(dui.bar[h], LV_OPA_COVER, 0);
-  lv_obj_set_style_bg_color(dui.bar[h], lv_color_hex(TH.line), 0);
-  lv_obj_set_style_bg_color(dui.bar[h], C_OK, LV_PART_INDICATOR);
-  lv_bar_set_range(dui.bar[h], 0, 100);
-  lv_bar_set_value(dui.bar[h], 0, LV_ANIM_OFF);
-
-  mkLabel(card, "VRAM", C_MUT, 0, 92, 12);
-  dui.vramVal[h] = mkLabel(card, "--", C_TXT, 0, 92, 12);
-  lv_obj_align(dui.vramVal[h], LV_ALIGN_TOP_RIGHT, 0, 92);
-  dui.vbar[h] = lv_bar_create(card);
-  lv_obj_set_size(dui.vbar[h], 220, 10);
-  lv_obj_set_pos(dui.vbar[h], 0, 110);
-  lv_obj_set_style_bg_opa(dui.vbar[h], LV_OPA_COVER, 0);
-  lv_obj_set_style_bg_color(dui.vbar[h], lv_color_hex(TH.line), 0);
-  lv_obj_set_style_bg_color(dui.vbar[h], C_ACCENT, LV_PART_INDICATOR);
-  lv_bar_set_range(dui.vbar[h], 0, 100);
-
-  mkLabel(card, "RAM", C_MUT, 0, 130, 12);
-  dui.ramVal[h] = mkLabel(card, "--", C_TXT, 0, 130, 12);
-  lv_obj_align(dui.ramVal[h], LV_ALIGN_TOP_RIGHT, 0, 130);
-  dui.rbar[h] = lv_bar_create(card);
-  lv_obj_set_size(dui.rbar[h], 220, 10);
-  lv_obj_set_pos(dui.rbar[h], 0, 148);
-  lv_obj_set_style_bg_opa(dui.rbar[h], LV_OPA_COVER, 0);
-  lv_obj_set_style_bg_color(dui.rbar[h], lv_color_hex(TH.line), 0);
-  lv_obj_set_style_bg_color(dui.rbar[h], C_ACCENT, LV_PART_INDICATOR);
-  lv_bar_set_range(dui.rbar[h], 0, 100);
-
-  mkLabel(card, "GPU", C_MUT, 0, 170, 12);
-  dui.gpu[h] = mkLabel(card, "--", C_TXT, 0, 184, 12);
-  lv_obj_set_width(dui.gpu[h], 220);
-  lv_obj_set_height(dui.gpu[h], 30);
-  lv_label_set_long_mode(dui.gpu[h], LV_LABEL_LONG_DOT);
-  dui.ver[h] = mkLabel(card, "", C_MUT, 0, 218, 12);
-  dui.queue[h] = mkLabel(card, "", C_MUT, 0, 236, 12);
+static lv_obj_t *mkBarIn(lv_obj_t *parent, int x, int y, int w, int h, lv_color_t ind) {
+  lv_obj_t *b = lv_bar_create(parent);
+  lv_obj_set_size(b, w, h);
+  lv_obj_set_pos(b, x, y);
+  lv_obj_set_style_bg_opa(b, LV_OPA_COVER, 0);
+  lv_obj_set_style_bg_color(b, lv_color_hex(TH.line), 0);
+  lv_obj_set_style_bg_color(b, ind, LV_PART_INDICATOR);
+  lv_obj_set_style_border_width(b, 0, 0);
+  lv_bar_set_range(b, 0, 100);
+  lv_bar_set_value(b, 0, LV_ANIM_OFF);
+  return b;
 }
 
-static void dualLogsColumn(int h, lv_obj_t *tile) {
-  int x = 4 + h * 240;
-  lv_obj_t *card = mkCard(tile, x, 4, 232, 278);
-  dui.title[h] = mkLabel(card, hostStr[h].length() ? hostStr[h].c_str() : "(unused)", C_MUT, 0, 0, 12);
-  lv_obj_set_width(dui.title[h], 150);
-  lv_label_set_long_mode(dui.title[h], LV_LABEL_LONG_DOT);
-  dui.logState[h] = mkLabel(card, "--", C_MUT, 0, 0, 12);
-  lv_obj_align(dui.logState[h], LV_ALIGN_TOP_RIGHT, 0, 0);
-  dui.logLabel[h] = lv_label_create(card);
-  lv_label_set_text(dui.logLabel[h], "");
-  lv_obj_set_style_text_color(dui.logLabel[h], C_TXT, 0);
-  lv_obj_set_style_text_font(dui.logLabel[h], &cn_font_12, 0);
-  lv_obj_set_width(dui.logLabel[h], 220);
-  lv_obj_set_height(dui.logLabel[h], 238);
-  lv_label_set_long_mode(dui.logLabel[h], LV_LABEL_LONG_CLIP);
-  lv_obj_set_pos(dui.logLabel[h], 0, 20);
-}
-
-static void dualOutputsColumn(int h, lv_obj_t *tile) {
-  int x = 4 + h * 240;
-  lv_obj_t *card = mkCard(tile, x, 4, 232, 278);
-  dui.title[h] = mkLabel(card, hostStr[h].length() ? hostStr[h].c_str() : "(unused)", C_MUT, 0, 0, 12);
-  lv_obj_set_width(dui.title[h], 220);
-  lv_label_set_long_mode(dui.title[h], LV_LABEL_LONG_DOT);
-  for (int k = 0; k < 2; k++) {
-    int y = 20 + k * 122;
-    lv_obj_t *item = mkCard(card, 0, y, 220, 114, C_INNER);
-    lv_obj_t *ph = lv_obj_create(item);
-    lv_obj_set_size(ph, THUMB_W, THUMB_H);
-    lv_obj_set_pos(ph, 0, 0);
-    lv_obj_set_style_bg_color(ph, C_CARD, 0);
-    lv_obj_set_style_border_width(ph, 0, 0);
-    lv_obj_clear_flag(ph, LV_OBJ_FLAG_SCROLLABLE);
-    dui.outPh[h][k] = lv_label_create(ph);
-    lv_label_set_text(dui.outPh[h][k], "no preview");
-    lv_obj_set_style_text_color(dui.outPh[h][k], C_MUT, 0);
-    lv_obj_set_style_text_font(dui.outPh[h][k], &cn_font_12, 0);
-    lv_obj_center(dui.outPh[h][k]);
-    dui.outCv[h][k] = lv_canvas_create(item);
-    lv_color_t *buf = (lv_color_t *)heap_caps_malloc(THUMB_W * THUMB_H * 2, MALLOC_CAP_SPIRAM);
-    if (buf) {
-      lv_canvas_set_buffer(dui.outCv[h][k], buf, THUMB_W, THUMB_H, LV_IMG_CF_TRUE_COLOR);
-      lv_canvas_fill_bg(dui.outCv[h][k], lv_color_hex(TH.inner), LV_OPA_COVER);
-      lv_obj_set_pos(dui.outCv[h][k], 0, 0);
-      lv_obj_add_flag(dui.outCv[h][k], LV_OBJ_FLAG_HIDDEN);
-    }
-    dui.outName[h][k] = mkLabel(item, "--", C_TXT, 106, 0, 12);
-    lv_obj_set_width(dui.outName[h][k], 100);
-    lv_obj_set_height(dui.outName[h][k], 16);
-    lv_label_set_long_mode(dui.outName[h][k], LV_LABEL_LONG_DOT);
-    dui.outMeta[h][k] = mkLabel(item, "", C_MUT, 106, 18, 12);
-    lv_obj_set_width(dui.outMeta[h][k], 100);
-    lv_obj_set_height(dui.outMeta[h][k], 64);
-    lv_label_set_long_mode(dui.outMeta[h][k], LV_LABEL_LONG_CLIP);
-  }
-}
-
-static void dualStateText(const HostView &v, char *state, size_t n, lv_color_t &col) {
+static void hostStateText(const HostView &v, char *state, size_t n, lv_color_t &col) {
   if (wst != W_ONLINE) { strlcpy(state, L("WIFI?", "无网络"), n); col = C_ERR; }
-  else if (!v.serverOk) { strlcpy(state, L("OFFLINE", "离线"), n); col = C_ERR; }
+  else if (!v.serverOk) {
+    bool linking = stillLinking(v.everSeen);
+    strlcpy(state, linking ? L("LINKING", "连接中") : L("OFFLINE", "离线"), n);
+    col = linking ? C_WARN : C_ERR;
+  }
   else if (v.run.running) { strlcpy(state, L("GENERATING", "生成中"), n); col = C_OK; }
   else if (v.run.pending > 0) { strlcpy(state, L("QUEUED", "排队中"), n); col = C_WARN; }
   else { strlcpy(state, L("IDLE", "空闲"), n); col = C_ACCENT; }
 }
 
-void refreshDualDash() {
-  for (int h = 0; h < 2; h++) {
-    if (!dui.state[h]) continue;
+// compact one-word form for the log header rows, where the ip needs the room
+static const char *hostStateShort(const HostView &v, lv_color_t &col) {
+  if (wst != W_ONLINE) { col = C_ERR; return L("WIFI", "网络"); }
+  if (!v.serverOk) {
+    bool linking = stillLinking(v.everSeen);
+    col = linking ? C_WARN : C_ERR;
+    return linking ? L("LINK", "连接") : L("OFF", "离线");
+  }
+  if (v.run.running) { col = C_OK; return L("RUN", "生成"); }
+  if (v.run.pending > 0) { col = C_WARN; return L("QUEUE", "排队"); }
+  col = C_ACCENT;
+  return L("IDLE", "空闲");
+}
+
+static const char *cellTitle(int h) {
+  static char buf[MAX_HOSTS][56];
+  if (!hostStr[h].length()) { strlcpy(buf[h], L("(unused)", "（未使用）"), 56); return buf[h]; }
+  if (hostPort[h] == DEFAULT_PORT) snprintf(buf[h], 56, "%s", hostStr[h].c_str());
+  else snprintf(buf[h], 56, "%s:%d", hostStr[h].c_str(), hostPort[h]);
+  return buf[h];
+}
+
+// One overview cell. Rows are added while they still fit, so 1x1 / 2x1 / 3x1 / 2x2
+// all come out of this builder; the queue moves into the title row when there is
+// no free row left.
+static void buildDashCell(int h, lv_obj_t *tile, int x, int y, int cw, int ch) {
+  DashCell &c = gdash[h];
+  lv_obj_t *card = mkCard(tile, x, y, cw, ch);
+  int iw = cw - 12, ih = ch - 12;
+  bool tight = (ih < 170);            // 2x2 cells: text-only memory rows, smaller state font
+  int gap = (ih >= 240) ? 6 : 0;
+  int cy = 0;
+
+  c.title = mkLabel(card, cellTitle(h), C_MUT, 0, cy, 12);
+  lv_obj_set_width(c.title, iw);
+  lv_label_set_long_mode(c.title, LV_LABEL_LONG_DOT);
+  cy += 16;
+
+  int sf = (!tight && iw >= 200) ? 20 : 16;
+  c.state = mkLabel(card, "--", C_ACCENT, 0, cy, sf);
+  c.dur = mkLabel(card, "00:00", C_TXT, 0, cy, sf);
+  lv_obj_align(c.dur, LV_ALIGN_TOP_RIGHT, 0, cy);
+  cy += sf + 4 + gap;
+
+  c.node = mkLabel(card, "", C_MUT, 0, cy, 12);
+  lv_obj_set_width(c.node, iw - 56);
+  lv_label_set_long_mode(c.node, LV_LABEL_LONG_DOT);
+  c.step = mkLabel(card, "", C_TXT, 0, cy, 12);
+  lv_obj_align(c.step, LV_ALIGN_TOP_RIGHT, 0, cy);
+  cy += 16 + gap;
+
+  c.bar = mkBarIn(card, 0, cy, iw, 10, C_OK);
+  cy += 14 + gap;
+
+  if (cy + 14 <= ih) {
+    mkLabel(card, "VRAM", C_MUT, 0, cy, 12);
+    c.vramVal = mkLabel(card, "--", C_TXT, 0, cy, 12);
+    lv_obj_align(c.vramVal, LV_ALIGN_TOP_RIGHT, 0, cy);
+    cy += 14;
+    if (!tight && cy + 12 <= ih) {
+      c.vbar = mkBarIn(card, 0, cy, iw, 10, C_ACCENT);
+      cy += 14 + gap;
+    }
+  }
+  if (cy + 14 <= ih) {
+    mkLabel(card, "RAM", C_MUT, 0, cy, 12);
+    c.ramVal = mkLabel(card, "--", C_TXT, 0, cy, 12);
+    lv_obj_align(c.ramVal, LV_ALIGN_TOP_RIGHT, 0, cy);
+    cy += 14;
+    if (!tight && cy + 12 <= ih) {
+      c.rbar = mkBarIn(card, 0, cy, iw, 10, C_ACCENT);
+      cy += 14 + gap;
+    }
+  }
+  if (cy + 14 <= ih) {
+    c.img = lv_img_create(card);
+    lv_obj_set_pos(c.img, 0, cy - 1);
+    c.gpu = mkLabel(card, "--", C_TXT, 20, cy, 12);
+    lv_obj_set_width(c.gpu, iw - 20);
+    lv_label_set_long_mode(c.gpu, LV_LABEL_LONG_DOT);
+    cy += 14;
+    if (cy + 14 <= ih) {
+      c.acc = mkLabel(card, "", C_MUT, 0, cy, 12);
+      lv_obj_set_width(c.acc, iw);
+      lv_label_set_long_mode(c.acc, LV_LABEL_LONG_DOT);
+      cy += 14 + gap;
+    }
+  }
+  if (cy + 14 <= ih) {
+    c.ver = mkLabel(card, "", C_MUT, 0, cy, 12);
+    lv_obj_set_width(c.ver, iw);
+    lv_label_set_long_mode(c.ver, LV_LABEL_LONG_DOT);
+    cy += 14;
+  }
+  if (cy + 14 <= ih) {
+    c.queue = mkLabel(card, "", C_MUT, 0, cy, 12);
+  } else {
+    c.queue = mkLabel(card, "", C_MUT, 0, 0, 12);
+    lv_obj_align(c.queue, LV_ALIGN_TOP_RIGHT, 0, 0);
+    lv_obj_set_width(c.title, iw - 44);
+  }
+}
+
+static void buildLogsCell(int h, lv_obj_t *tile, int x, int y, int cw, int ch) {
+  LogCell &c = glog[h];
+  lv_obj_t *card = mkCard(tile, x, y, cw, ch);
+  int iw = cw - 12, ih = ch - 12;
+  c.title = mkLabel(card, cellTitle(h), C_MUT, 0, 0, 12);
+  lv_obj_set_width(c.title, iw - 40);
+  lv_label_set_long_mode(c.title, LV_LABEL_LONG_DOT);
+  c.state = mkLabel(card, "--", C_MUT, 0, 0, 12);
+  lv_obj_align(c.state, LV_ALIGN_TOP_RIGHT, 0, 0);
+  c.log = lv_label_create(card);
+  lv_label_set_text(c.log, "");
+  lv_obj_set_style_text_color(c.log, C_TXT, 0);
+  lv_obj_set_style_text_font(c.log, &cn_font_12, 0);
+  lv_obj_set_width(c.log, iw);
+  lv_obj_set_height(c.log, ih - 18);
+  lv_label_set_long_mode(c.log, LV_LABEL_LONG_CLIP);
+  lv_obj_set_pos(c.log, 0, 18);
+  c.lines = (ih - 18) / 15;
+  if (c.lines < 1) c.lines = 1;
+}
+
+static void buildOutCell(int h, lv_obj_t *tile, int x, int y, int cw, int ch) {
+  OutCell &c = gout[h];
+  lv_obj_t *card = mkCard(tile, x, y, cw, ch);
+  int iw = cw - 12, ih = ch - 12;
+  c.title = mkLabel(card, cellTitle(h), C_MUT, 0, 0, 12);
+  lv_obj_set_width(c.title, iw);
+  lv_label_set_long_mode(c.title, LV_LABEL_LONG_DOT);
+  c.jobs = (iw >= 200 && ih >= 200) ? 2 : 1;
+  bool sideBySide = (iw >= 200);
+  for (int k = 0; k < c.jobs; k++) {
+    lv_obj_t *item;
+    int tx, ty, tw, th;
+    if (sideBySide) {
+      int itemH = (ih - 20 - (c.jobs - 1) * 4) / c.jobs;
+      item = mkCard(card, 0, 20 + k * (itemH + 4), iw, itemH, C_INNER);
+      tx = 106; ty = 0; tw = iw - 112; th = itemH - 6;
+    } else {
+      item = mkCard(card, 0, 20 + k * (ih - 20), iw, ih - 20, C_INNER);
+      tx = 0; ty = THUMB_H + 4; tw = iw; th = ih - 20 - 12 - ty;
+    }
+    int tx2 = sideBySide ? 0 : (iw - THUMB_W) / 2;
+    lv_obj_t *ph = lv_obj_create(item);
+    lv_obj_set_size(ph, THUMB_W, THUMB_H);
+    lv_obj_set_pos(ph, tx2, 0);
+    lv_obj_set_style_bg_color(ph, C_CARD, 0);
+    lv_obj_set_style_border_width(ph, 0, 0);
+    lv_obj_set_style_radius(ph, 4, 0);
+    lv_obj_set_style_pad_all(ph, 0, 0);
+    lv_obj_clear_flag(ph, LV_OBJ_FLAG_SCROLLABLE);
+    c.ph[k] = lv_label_create(ph);
+    lv_label_set_text(c.ph[k], L("loading...", "加载中…"));
+    lv_obj_set_style_text_color(c.ph[k], C_MUT, 0);
+    lv_obj_set_style_text_font(c.ph[k], &cn_font_12, 0);
+    lv_obj_set_width(c.ph[k], THUMB_W - 4);
+    lv_label_set_long_mode(c.ph[k], LV_LABEL_LONG_WRAP);
+    lv_obj_center(c.ph[k]);
+    lv_color_t *buf = (lv_color_t *)heap_caps_malloc(THUMB_W * THUMB_H * 2, MALLOC_CAP_SPIRAM);
+    c.cv[k] = lv_canvas_create(item);
+    if (buf) {
+      lv_canvas_set_buffer(c.cv[k], buf, THUMB_W, THUMB_H, LV_IMG_CF_TRUE_COLOR);
+      lv_canvas_fill_bg(c.cv[k], lv_color_hex(TH.inner), LV_OPA_COVER);
+    }
+    lv_obj_set_pos(c.cv[k], tx2, 0);
+    lv_obj_add_flag(c.cv[k], LV_OBJ_FLAG_HIDDEN);
+    c.name[k] = mkLabel(item, "--", C_TXT, tx, ty, 12);
+    lv_obj_set_width(c.name[k], tw);
+    lv_obj_set_height(c.name[k], 16);
+    lv_label_set_long_mode(c.name[k], LV_LABEL_LONG_DOT);
+    c.meta[k] = mkLabel(item, "", C_MUT, tx, ty + 18, 12);
+    lv_obj_set_width(c.meta[k], tw);
+    lv_obj_set_height(c.meta[k], th > 20 ? th - 18 : 12);
+    lv_label_set_long_mode(c.meta[k], LV_LABEL_LONG_CLIP);
+  }
+}
+
+void refreshGridDash() {
+  char t[72], st[16];
+  for (int h = 0; h < nHosts && h < MAX_HOSTS; h++) {
+    DashCell &c = gdash[h];
+    if (!c.state) continue;
     const HostView &v = dview[h];
-    char t[64], st[16];
     lv_color_t col;
-    dualStateText(v, st, sizeof(st), col);
-    setLbl(dui.state[h], st);
-    lv_obj_set_style_text_color(dui.state[h], col, 0);
-    uint32_t secs = v.run.running && v.run.start_ms ? (millis() - v.run.start_ms) / 1000 : 0;
-    snprintf(t, sizeof(t), "%02u:%02u", (unsigned)(secs / 60), (unsigned)(secs % 60));
-    setLbl(dui.dur[h], t);
-    if (v.run.running && v.run.node[0]) snprintf(t, sizeof(t), L("node %s", "节点 %s"), v.run.node);
+    hostStateText(v, st, sizeof(st), col);
+    setLbl(c.state, st);
+    lv_obj_set_style_text_color(c.state, col, 0);
+    uint32_t secs = (v.serverOk && v.run.running && v.run.start_ms) ? (millis() - v.run.start_ms) / 1000 : 0;
+    if (v.serverOk) snprintf(t, sizeof(t), "%02u:%02u", (unsigned)(secs / 60), (unsigned)(secs % 60));
+    else strcpy(t, "--:--");
+    setLbl(c.dur, t);
+    if (!v.serverOk) snprintf(t, sizeof(t), "%s", stillLinking(v.everSeen) ? L("waiting...", "等待连接…") : L("no response", "无响应"));
+    else if (v.run.running && v.run.node[0]) snprintf(t, sizeof(t), L("node %s", "节点 %s"), v.run.node);
     else if (v.run.running) snprintf(t, sizeof(t), L("node -", "节点 -"));
     else snprintf(t, sizeof(t), L("no job", "无任务"));
-    setLbl(dui.node[h], t);
+    setLbl(c.node, t);
     float pct = 0;
     if (v.run.pmax > 0) {
       pct = 100.0f * v.run.pv / v.run.pmax;
@@ -1189,73 +1455,216 @@ void refreshDualDash() {
       int den = v.nodeTotal - v.nodesCached; if (den < 1) den = 1;
       pct = 100.0f * v.nodesDone / den;
       snprintf(t, sizeof(t), L("nodes %d/%d", "节点 %d/%d"), v.nodesDone, den);
-    } else snprintf(t, sizeof(t), "");
-    setLbl(dui.step[h], t);
-    if (lv_bar_get_value(dui.bar[h]) != (int)pct) lv_bar_set_value(dui.bar[h], (int)pct, LV_ANIM_OFF);
-    if (v.vitals.ok && v.vitals.vram_total > 0) {
-      double used = v.vitals.vram_total - v.vitals.vram_free;
-      float p = 100.0 * used / v.vitals.vram_total;
-      snprintf(t, sizeof(t), "%.1f/%.0fG", used / 1073741824.0, v.vitals.vram_total / 1073741824.0);
-      if (lv_bar_get_value(dui.vbar[h]) != (int)p) lv_bar_set_value(dui.vbar[h], (int)p, LV_ANIM_OFF);
-      setLbl(dui.vramVal[h], t);
-    } else setLbl(dui.vramVal[h], "--");
-    if (v.vitals.ok && v.vitals.ram_total > 0) {
-      double used = v.vitals.ram_total - v.vitals.ram_free;
-      float p = 100.0 * used / v.vitals.ram_total;
-      snprintf(t, sizeof(t), "%.1f/%.0fG", used / 1073741824.0, v.vitals.ram_total / 1073741824.0);
-      if (lv_bar_get_value(dui.rbar[h]) != (int)p) lv_bar_set_value(dui.rbar[h], (int)p, LV_ANIM_OFF);
-      setLbl(dui.ramVal[h], t);
-    } else setLbl(dui.ramVal[h], "--");
-    if (v.vitals.ok) {
-      setLbl(dui.gpu[h], v.vitals.gpu_name);
-      snprintf(t, sizeof(t), "ComfyUI v%s", v.vitals.version);
-      setLbl(dui.ver[h], t);
-    } else {
-      setLbl(dui.gpu[h], "--");
-      setLbl(dui.ver[h], v.serverOk ? L("connected", "已连接") : L("unreachable", "不可达"));
+    } else strcpy(t, "");
+    setLbl(c.step, t);
+    if (pct < 0) pct = 0;
+    if (pct > 100) pct = 100;
+    setBar(c.bar, (int)pct, C_OK, nullptr, "");
+    if (c.vramVal) {
+      if (v.vitals.ok && v.vitals.vram_total > 0) {
+        double used = v.vitals.vram_total - v.vitals.vram_free;
+        if (used < 0) used = 0;
+        float p = 100.0 * used / v.vitals.vram_total;
+        snprintf(t, sizeof(t), "%.1f/%.0fG", used / 1073741824.0, v.vitals.vram_total / 1073741824.0);
+        setBar(c.vbar, (int)(p + 0.5f), C_ACCENT, c.vramVal, t);
+      } else setBar(c.vbar, 0, C_ACCENT, c.vramVal, "--");
     }
-    snprintf(t, sizeof(t), L("queue %d", "队列 %d"), v.run.pending);
-    setLbl(dui.queue[h], t);
+    if (c.ramVal) {
+      if (v.vitals.ok && v.vitals.ram_total > 0) {
+        double used = v.vitals.ram_total - v.vitals.ram_free;
+        if (used < 0) used = 0;
+        float p = 100.0 * used / v.vitals.ram_total;
+        snprintf(t, sizeof(t), "%.1f/%.0fG", used / 1073741824.0, v.vitals.ram_total / 1073741824.0);
+        setBar(c.rbar, (int)(p + 0.5f), C_ACCENT, c.ramVal, t);
+      } else setBar(c.rbar, 0, C_ACCENT, c.ramVal, "--");
+    }
+    if (c.gpu) {
+      setLbl(c.gpu, v.vitals.ok ? v.vitals.gpu : "--");
+      setGpuMark(c.img, v.vitals.ok ? v.vitals.gpuVendor : 0);
+      setLbl(c.acc, v.vitals.ok ? v.vitals.accel : "");
+    }
+    if (c.ver) {
+      if (!v.vitals.ok) setLbl(c.ver, v.serverOk ? L("connected", "已连接") : (stillLinking(v.everSeen) ? L("connecting...", "连接中…") : L("offline", "离线")));
+      else snprintf(t, sizeof(t), "ComfyUI v%s", v.vitals.version);
+      setLbl(c.ver, t);
+    }
+    if (c.queue) {
+      if (v.serverOk) snprintf(t, sizeof(t), L("queue %d", "队列 %d"), v.run.pending);
+      else strcpy(t, L("queue -", "队列 -"));
+      setLbl(c.queue, t);
+    }
   }
 }
 
-void refreshDualLogs() {
-  for (int h = 0; h < 2; h++) {
-    if (!dui.logLabel[h]) continue;
+static lv_color_t pctColor(int p) {
+  if (p < 0) return C_MUT;
+  if (p < 60) return C_OK;
+  if (p < 85) return C_WARN;
+  return C_ERR;
+}
+// Ultra overview cell. Tall cells (1/2/3 hosts) get full metric bars; short 2x2
+// cells (4 hosts) collapse the four metrics into a compact percent grid.
+static void buildUltraCell(int h, lv_obj_t *tile, int x, int y, int cw, int ch) {
+  UltraCell &c = ucell[h];
+  lv_obj_t *card = mkCard(tile, x, y, cw, ch);
+  int iw = cw - 12, ih = ch - 12;
+  c.compact = (ih < 200);
+  static const char *MLBL[4] = {"CPU", "GPU", "RAM", "VRAM"};
+  int cy = 0;
+  c.title = mkLabel(card, cellTitle(h), C_MUT, 0, cy, 12);
+  lv_obj_set_width(c.title, iw - 44);
+  lv_label_set_long_mode(c.title, LV_LABEL_LONG_DOT);
+  c.queue = mkLabel(card, "", C_MUT, 0, cy, 12);
+  lv_obj_align(c.queue, LV_ALIGN_TOP_RIGHT, 0, cy);
+  cy += 16;
+  int sf = (!c.compact && iw >= 200) ? 20 : 16;
+  c.state = mkLabel(card, "--", C_ACCENT, 0, cy, sf);
+  c.dur = mkLabel(card, "00:00", C_TXT, 0, cy, sf);
+  lv_obj_align(c.dur, LV_ALIGN_TOP_RIGHT, 0, cy);
+  cy += sf + 4;
+  if (!c.compact) {
+    c.node = mkLabel(card, "", C_MUT, 0, cy, 12);
+    lv_obj_set_width(c.node, iw - 56);
+    lv_label_set_long_mode(c.node, LV_LABEL_LONG_DOT);
+    c.step = mkLabel(card, "", C_TXT, 0, cy, 12);
+    lv_obj_align(c.step, LV_ALIGN_TOP_RIGHT, 0, cy);
+    cy += 18;
+  }
+  c.bar = mkBarIn(card, 0, cy, iw, 10, C_OK);
+  cy += 16;
+  if (!c.compact) {
+    c.img = lv_img_create(card);
+    lv_obj_set_pos(c.img, 0, cy - 1);
+    c.gpu = mkLabel(card, "--", C_TXT, 20, cy, 12);
+    lv_obj_set_width(c.gpu, iw - 20);
+    lv_label_set_long_mode(c.gpu, LV_LABEL_LONG_DOT);
+    cy += 18;
+    for (int k = 0; k < 4; k++) {
+      c.mLbl[k] = mkLabel(card, MLBL[k], C_MUT, 0, cy, 12);
+      c.mVal[k] = mkLabel(card, "--", C_TXT, 0, cy, 12);
+      lv_obj_align(c.mVal[k], LV_ALIGN_TOP_RIGHT, 0, cy);
+      c.mBar[k] = mkBarIn(card, 0, cy + 15, iw, 7, C_ACCENT);
+      cy += 27;
+    }
+  } else {
+    int tw = (iw - 6) / 2;
+    for (int k = 0; k < 4; k++) {
+      int tx = (k % 2) * (tw + 6);
+      int ty = cy + (k / 2) * 26;
+      lv_obj_t *t = mkCard(card, tx, ty, tw, 24, C_INNER);
+      c.mLbl[k] = mkLabel(t, MLBL[k], C_MUT, 0, 3, 12);
+      c.mVal[k] = mkLabel(t, "--", C_TXT, 0, 3, 12);
+      lv_obj_align(c.mVal[k], LV_ALIGN_TOP_RIGHT, 0, 3);
+    }
+    cy += 52;
+  }
+  c.power = mkLabel(card, "", C_MUT, 0, cy, 12);
+  lv_obj_set_width(c.power, iw);
+  lv_label_set_long_mode(c.power, LV_LABEL_LONG_DOT);
+}
+void refreshUltraDash() {
+  char t[72], st[16];
+  for (int h = 0; h < nHosts && h < MAX_HOSTS; h++) {
+    UltraCell &c = ucell[h];
+    if (!c.state) continue;
     const HostView &v = dview[h];
-    char st[16];
+    const Ultra &u = v.ultra;
     lv_color_t col;
-    dualStateText(v, st, sizeof(st), col);
-    setLbl(dui.logState[h], st);
-    lv_obj_set_style_text_color(dui.logState[h], col, 0);
+    hostStateText(v, st, sizeof(st), col);
+    setLbl(c.state, st);
+    lv_obj_set_style_text_color(c.state, col, 0);
+    uint32_t secs = (v.serverOk && v.run.running && v.run.start_ms) ? (millis() - v.run.start_ms) / 1000 : 0;
+    if (v.serverOk) snprintf(t, sizeof(t), "%02u:%02u", (unsigned)(secs / 60), (unsigned)(secs % 60));
+    else strcpy(t, "--:--");
+    setLbl(c.dur, t);
+    if (c.node) {
+      if (!v.serverOk) snprintf(t, sizeof(t), "%s", stillLinking(v.everSeen) ? L("waiting...", "等待连接…") : L("no response", "无响应"));
+      else if (v.run.running && v.run.node[0]) snprintf(t, sizeof(t), L("node %s", "节点 %s"), v.run.node);
+      else if (v.run.running) snprintf(t, sizeof(t), L("node -", "节点 -"));
+      else snprintf(t, sizeof(t), L("no job", "无任务"));
+      setLbl(c.node, t);
+    }
+    float pct = 0;
+    if (v.run.pmax > 0) {
+      pct = 100.0f * v.run.pv / v.run.pmax;
+      snprintf(t, sizeof(t), "%d/%d %d%%", (int)v.run.pv, (int)v.run.pmax, (int)pct);
+    } else if (v.run.running && v.nodeTotal > 0) {
+      int den = v.nodeTotal - v.nodesCached; if (den < 1) den = 1;
+      pct = 100.0f * v.nodesDone / den;
+      snprintf(t, sizeof(t), L("nodes %d/%d", "节点 %d/%d"), v.nodesDone, den);
+    } else strcpy(t, "");
+    if (c.step) setLbl(c.step, t);
+    if (pct < 0) pct = 0; if (pct > 100) pct = 100;
+    setBar(c.bar, (int)pct, C_OK, nullptr, "");
+    if (c.queue) {
+      if (v.serverOk) snprintf(t, sizeof(t), L("Q%d", "队%d"), v.run.pending);
+      else strcpy(t, L("Q-", "队-"));
+      setLbl(c.queue, t);
+    }
+    if (c.gpu) {
+      setLbl(c.gpu, v.vitals.ok ? v.vitals.gpu : (u.ok ? u.gpuName : "--"));
+      setGpuMark(c.img, v.vitals.ok ? v.vitals.gpuVendor : u.gpuVendor);
+    }
+    int vals[4] = {u.cpu, u.gpu, u.ram, u.vram};
+    for (int k = 0; k < 4; k++) {
+      if (!c.mVal[k]) continue;
+      int p = vals[k];
+      bool unknown = !u.ok || p < 0;
+      if (unknown) strcpy(t, "--"); else snprintf(t, sizeof(t), "%d%%", p);
+      setLbl(c.mVal[k], t);
+      lv_obj_set_style_text_color(c.mVal[k], unknown ? C_MUT : pctColor(p), 0);
+      if (c.mBar[k]) setBar(c.mBar[k], unknown ? 0 : p, pctColor(p), nullptr, "");
+    }
+    if (c.power) {
+      if (!u.ok) snprintf(t, sizeof(t), "%s", u.everSeen ? L("power: assistant offline", "功耗：助手离线") : L("power: connecting", "功耗：连接中"));
+      else if (u.watts < 0) snprintf(t, sizeof(t), "%s", L("power --", "功耗 --"));
+      else snprintf(t, sizeof(t), L("power %.0f W", "功耗 %.0f W"), u.watts);
+      setLbl(c.power, t);
+      lv_obj_set_style_text_color(c.power, (u.ok && u.watts >= 0) ? C_WARN : C_MUT, 0);
+    }
+  }
+}
+void refreshGridLogs() {
+  char st[16];
+  for (int h = 0; h < nHosts && h < MAX_HOSTS; h++) {
+    LogCell &c = glog[h];
+    if (!c.log) continue;
+    const HostView &v = dview[h];
+    lv_color_t col;
+    setLbl(c.state, hostStateShort(v, col));
+    lv_obj_set_style_text_color(c.state, col, 0);
     lockNet();
     if (dviewLogVer[h] != net[h].logVer) {
       dviewLogVer[h] = net[h].logVer;
-      char buf[13 * 52];
-      buf[0] = 0;
-      int shown = net[h].logCount > 13 ? 13 : net[h].logCount;
+      int shown = net[h].logCount;
+      if (shown > c.lines) shown = c.lines;
       int start = net[h].logCount - shown;
+      static char buf[LOG_LINES * 52];
+      buf[0] = 0;
       for (int i = 0; i < shown; i++) {
-        strcat(buf, net[h].logLines[start + i]);
-        if (i < shown - 1) strcat(buf, "\n");
+        strlcat(buf, net[h].logLines[start + i], sizeof(buf));
+        if (i < shown - 1) strlcat(buf, "\n", sizeof(buf));
       }
       unlockNet();
-      setLbl(dui.logLabel[h], buf);
+      setLbl(c.log, buf);
     } else {
       unlockNet();
     }
   }
 }
 
-void refreshDualOutputs() {
-  for (int h = 0; h < 2; h++) {
-    for (int k = 0; k < 2; k++) {
-      if (!dui.outName[h][k]) continue;
-      if (k < dview[h].nJobs) {
+void refreshGridOut() {
+  for (int h = 0; h < nHosts && h < MAX_HOSTS; h++) {
+    OutCell &c = gout[h];
+    if (!c.title) continue;
+    const HostView &v = dview[h];
+    for (int k = 0; k < c.jobs; k++) {
+      if (!c.name[k]) continue;
+      if (k < v.nJobs) {
         char nm[20], info[220];
-        jobInfo(dview[h].jobs[k], true, nm, sizeof(nm), info, sizeof(info));
-        setLbl(dui.outName[h][k], nm);
-        setLbl(dui.outMeta[h][k], info);
+        jobInfo(v.jobs[k], true, nm, sizeof(nm), info, sizeof(info));
+        setLbl(c.name[k], nm);
+        setLbl(c.meta[k], info);
         bool has = false;
         uint8_t tstate = 0;
         lockNet();
@@ -1264,7 +1673,7 @@ void refreshDualOutputs() {
         has = (tstate == 1);
         if (dviewThumbVer[h][k] != nd.thumbVer[k]) {
           dviewThumbVer[h][k] = nd.thumbVer[k];
-          lv_img_dsc_t *img = (lv_img_dsc_t *)lv_canvas_get_img(dui.outCv[h][k]);
+          lv_img_dsc_t *img = (lv_img_dsc_t *)lv_canvas_get_img(c.cv[k]);
           if (img && img->data && nd.thumbs[k] && tstate == 1) {
             memcpy((void *)img->data, nd.thumbs[k], THUMB_W * THUMB_H * 2);
             has = true;
@@ -1272,20 +1681,20 @@ void refreshDualOutputs() {
         }
         unlockNet();
         if (has) {
-          lv_obj_clear_flag(dui.outCv[h][k], LV_OBJ_FLAG_HIDDEN);
-          lv_obj_add_flag(dui.outPh[h][k], LV_OBJ_FLAG_HIDDEN);
-          lv_obj_invalidate(dui.outCv[h][k]);
+          lv_obj_clear_flag(c.cv[k], LV_OBJ_FLAG_HIDDEN);
+          lv_obj_add_flag(c.ph[k], LV_OBJ_FLAG_HIDDEN);
+          lv_obj_invalidate(c.cv[k]);
         } else {
-          lv_obj_add_flag(dui.outCv[h][k], LV_OBJ_FLAG_HIDDEN);
-          lv_obj_clear_flag(dui.outPh[h][k], LV_OBJ_FLAG_HIDDEN);
-          setLbl(dui.outPh[h][k], tstate == 3 ? L("no preview", "无预览") : (tstate == 2 ? L("failed", "失败") : L("loading...", "加载中…")));
+          lv_obj_add_flag(c.cv[k], LV_OBJ_FLAG_HIDDEN);
+          lv_obj_clear_flag(c.ph[k], LV_OBJ_FLAG_HIDDEN);
+          setLbl(c.ph[k], tstate == 3 ? L("no preview", "无预览") : (tstate == 2 ? L("failed", "失败") : L("loading...", "加载中…")));
         }
       } else {
-        setLbl(dui.outName[h][k], "--");
-        setLbl(dui.outMeta[h][k], "");
-        lv_obj_add_flag(dui.outCv[h][k], LV_OBJ_FLAG_HIDDEN);
-        lv_obj_clear_flag(dui.outPh[h][k], LV_OBJ_FLAG_HIDDEN);
-        setLbl(dui.outPh[h][k], L("empty", "空"));
+        setLbl(c.name[k], "--");
+        setLbl(c.meta[k], "");
+        lv_obj_add_flag(c.cv[k], LV_OBJ_FLAG_HIDDEN);
+        lv_obj_clear_flag(c.ph[k], LV_OBJ_FLAG_HIDDEN);
+        setLbl(c.ph[k], L("empty", "空"));
       }
     }
   }
@@ -1297,10 +1706,26 @@ void buildDashboard() {
   lastDashBuild = millis();
   if (scrDash) {
     if (scrSetup && lv_scr_act() == scrDash) lv_scr_load(scrSetup);
+    // canvas buffers are ours (PSRAM), LVGL only frees the widget
+    for (int h = 0; h < MAX_HOSTS; h++) {
+      lv_obj_t *cvs[MAX_JOBS * 2];
+      int nc = 0;
+      for (int k = 0; k < MAX_JOBS; k++) {
+        if (oui[h].canvas[k]) cvs[nc++] = oui[h].canvas[k];
+        if (gout[h].cv[k]) cvs[nc++] = gout[h].cv[k];
+      }
+      for (int k = 0; k < nc; k++) {
+        const lv_img_dsc_t *d = lv_canvas_get_img(cvs[k]);
+        if (d && d->data) free((void *)d->data);
+      }
+    }
     lv_obj_del(scrDash);
     scrDash = nullptr;
   }
-  for (int i = 0; i < MAX_HOSTS; i++) { mui[i] = MonUI(); oui[i] = OutUI(); }
+  for (int i = 0; i < MAX_HOSTS; i++) {
+    mui[i] = MonUI(); oui[i] = OutUI();
+    gdash[i] = DashCell(); glog[i] = LogCell(); gout[i] = OutCell(); ucell[i] = UltraCell();
+  }
   for (int i = 0; i < MAX_HOSTS; i++) {
     lastVer[i] = 0xFFFFFFFFu;
     lastLogVer[i] = 0xFFFFFFFFu;
@@ -1374,37 +1799,41 @@ void buildDashboard() {
   lv_obj_set_scrollbar_mode(tileView, LV_SCROLLBAR_MODE_OFF);
   lv_obj_set_style_anim_time(tileView, 150, 0);
 
-  if (dualMode) {
+  if (useGrid()) {
+    int C = gridCols(), R = gridRows();
+    int cw = (UI_W - 8 - (C - 1) * 4) / C;
+    int ch = (286 - 8 - (R - 1) * 4) / R;
     for (int pg = 0; pg < 3; pg++) {
       lv_obj_t *t1 = lv_tileview_add_tile(tileView, pg, 0, LV_DIR_HOR);
       lv_obj_set_style_bg_color(t1, C_BG, 0);
       lv_obj_set_style_border_width(t1, 0, 0);
       lv_obj_set_style_pad_all(t1, 0, 0);
-      if (pg == 0) { dualDashColumn(0, t1); dualDashColumn(1, t1); }
-      else if (pg == 1) { dualLogsColumn(0, t1); dualLogsColumn(1, t1); }
-      else { dualOutputsColumn(0, t1); dualOutputsColumn(1, t1); }
+      for (int h = 0; h < nHosts && h < MAX_HOSTS; h++) {
+        int x = 4 + (h % C) * (cw + 4);
+        int y = 4 + (h / C) * (ch + 4);
+        if (pg == 0) { if (ultraEnabled) buildUltraCell(h, t1, x, y, cw, ch); else buildDashCell(h, t1, x, y, cw, ch); }
+        else if (pg == 1) buildLogsCell(h, t1, x, y, cw, ch);
+        else buildOutCell(h, t1, x, y, cw, ch);
+      }
     }
   } else {
-    for (int i = 0; i < nHosts; i++) {
-      lv_obj_t *t1 = lv_tileview_add_tile(tileView, i * 2, 0, LV_DIR_HOR);
-      lv_obj_set_style_bg_color(t1, C_BG, 0);
-      lv_obj_set_style_border_width(t1, 0, 0);
-      lv_obj_set_style_pad_all(t1, 0, 0);
-      buildMonitor(i, t1);
-      lv_obj_t *t2 = lv_tileview_add_tile(tileView, i * 2 + 1, 0, LV_DIR_HOR);
-      lv_obj_set_style_bg_color(t2, C_BG, 0);
-      lv_obj_set_style_border_width(t2, 0, 0);
-      lv_obj_set_style_pad_all(t2, 0, 0);
-      buildOutputs(i, t2);
-    }
+    lv_obj_t *t1 = lv_tileview_add_tile(tileView, 0, 0, LV_DIR_HOR);
+    lv_obj_set_style_bg_color(t1, C_BG, 0);
+    lv_obj_set_style_border_width(t1, 0, 0);
+    lv_obj_set_style_pad_all(t1, 0, 0);
+    buildMonitor(0, t1);
+    lv_obj_t *t2 = lv_tileview_add_tile(tileView, 1, 0, LV_DIR_HOR);
+    lv_obj_set_style_bg_color(t2, C_BG, 0);
+    lv_obj_set_style_border_width(t2, 0, 0);
+    lv_obj_set_style_pad_all(t2, 0, 0);
+    buildOutputs(0, t2);
   }
   lv_obj_add_event_cb(tileView, [](lv_event_t *) {
     if (millis() - lastDashBuild < 1000) return;
     lv_obj_t *act = lv_tileview_get_tile_act(tileView);
     if (!act) return;
     int idx = (int)lv_obj_get_index(act);
-    int maxIdx = dualMode ? 3 : nHosts * 2;
-    if (idx >= 0 && idx < maxIdx && idx != activePageIdx) switchPage(idx);
+    if (idx >= 0 && idx < pageCount() && idx != activePageIdx) switchPage(idx);
   }, LV_EVENT_VALUE_CHANGED, NULL);
 
   activeHost = 0; activePage = 0; activePageIdx = 0;
@@ -1412,16 +1841,16 @@ void buildDashboard() {
   lv_obj_set_tile_id(tileView, 0, 0, LV_ANIM_OFF);
   lockNet();
   for (int i = 0; i < MAX_HOSTS; i++) net[i].wantThumbs = false;
-  if (!dualMode) net[0].wantThumbs = true;
+  if (!useGrid()) net[0].wantThumbs = true;
   unlockNet();
-  dviewVer[0] = dviewVer[1] = 0xFFFFFFFFu;
-  dviewLogVer[0] = dviewLogVer[1] = 0xFFFFFFFFu;
-  for (int k = 0; k < MAX_JOBS; k++) { dviewThumbVer[0][k] = 0xFFFFFFFFu; dviewThumbVer[1][k] = 0xFFFFFFFFu; }
+  for (int i = 0; i < MAX_HOSTS; i++) {
+    dviewVer[i] = 0xFFFFFFFFu;
+    dviewLogVer[i] = 0xFFFFFFFFu;
+    for (int k = 0; k < MAX_JOBS; k++) dviewThumbVer[i][k] = 0xFFFFFFFFu;
+  }
   updatePageDots();
   refreshHeader();
   refreshClock();
-  lv_obj_t *t0 = lv_obj_get_child(tileView, 0);
-  (void)t0;
 }
 
 // ================= UI refresh =================
@@ -1432,22 +1861,29 @@ void refreshMonitor() {
   const char *s;
   lv_color_t c;
   if (wst != W_ONLINE) { s = L("WIFI?", "无网络"); c = C_ERR; }
-  else if (!serverOk) { s = L("OFFLINE", "离线"); c = C_ERR; }
+  else if (!serverOk) {
+    bool linking = stillLinking(everSeen);
+    s = linking ? L("CONNECTING", "连接中") : L("OFFLINE", "离线");
+    c = linking ? C_WARN : C_ERR;
+  }
   else if (run.running) { s = L("GENERATING", "生成中"); c = C_OK; }
   else if (run.pending > 0) { s = L("QUEUED", "排队中"); c = C_WARN; }
   else { s = L("IDLE", "空闲"); c = C_ACCENT; }
   setLbl(m.lblState, s);
   lv_obj_set_style_text_color(m.lblState, c, 0);
 
-  uint32_t secs = run.running && run.start_ms ? (millis() - run.start_ms) / 1000 : 0;
-  snprintf(t, sizeof(t), "%02u:%02u", (unsigned)(secs / 60), (unsigned)(secs % 60));
+  uint32_t secs = (serverOk && run.running && run.start_ms) ? (millis() - run.start_ms) / 1000 : 0;
+  if (serverOk) snprintf(t, sizeof(t), "%02u:%02u", (unsigned)(secs / 60), (unsigned)(secs % 60));
+  else strcpy(t, "--:--");
   setLbl(m.lblDur, t);
 
-  if (run.running && strlen(run.node)) snprintf(t, sizeof(t), L("node %s", "节点 %s"), run.node);
+  if (!serverOk) snprintf(t, sizeof(t), "%s", stillLinking(everSeen) ? L("waiting...", "等待连接…") : L("no response", "无响应"));
+  else if (run.running && strlen(run.node)) snprintf(t, sizeof(t), L("node %s", "节点 %s"), run.node);
   else if (run.running) snprintf(t, sizeof(t), L("node -", "节点 -"));
   else snprintf(t, sizeof(t), L("no job running", "无任务"));
   setLbl(m.lblNode, t);
-  snprintf(t, sizeof(t), L("queue %d", "队列 %d"), run.pending);
+  if (serverOk) snprintf(t, sizeof(t), L("queue %d", "队列 %d"), run.pending);
+  else strcpy(t, L("queue -", "队列 -"));
   setLbl(m.lblQueue, t);
 
   bool haveProg = run.running && run.pmax > 0;
@@ -1475,6 +1911,14 @@ void refreshMonitor() {
     lv_obj_clear_flag(m.lblStep, LV_OBJ_FLAG_HIDDEN);
     setLbl(m.lblHint, "");
     lv_obj_add_flag(m.lblHint, LV_OBJ_FLAG_HIDDEN);
+  } else if (!serverOk) {
+    lv_obj_add_flag(m.barProg, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag(m.spinner, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag(m.lblStep, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_clear_flag(m.lblHint, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_set_pos(m.lblHint, 10, 45);
+    setLbl(m.lblHint, stillLinking(everSeen) ? L("connecting to host...", "正在连接主机…")
+                                             : L("host offline - check power / ip:port", "主机离线 - 检查电源 / IP:端口"));
   } else if (run.running) {
     lv_obj_add_flag(m.barProg, LV_OBJ_FLAG_HIDDEN);
     lv_obj_clear_flag(m.spinner, LV_OBJ_FLAG_HIDDEN);
@@ -1492,25 +1936,55 @@ void refreshMonitor() {
     setLbl(m.lblHint, L("idle - logs above update while a job runs", "空闲 - 任务运行时更新日志"));
   }
 
-  if (vitals.ok && vitals.vram_total > 0) {
+  if (ultraEnabled) {
+    int vals[4] = {ultra.cpu, ultra.gpu, ultra.ram, ultra.vram};
+    for (int k = 0; k < 4; k++) {
+      if (!m.uVal[k]) continue;
+      int p = vals[k];
+      bool unknown = !ultra.ok || p < 0;
+      if (unknown) strcpy(t, "--"); else snprintf(t, sizeof(t), "%d%%", p);
+      setLbl(m.uVal[k], t);
+      lv_obj_set_style_text_color(m.uVal[k], unknown ? C_MUT : pctColor(p), 0);
+      setBar(m.uBar[k], unknown ? 0 : p, pctColor(p), nullptr, "");
+    }
+    if (m.uPower) {
+      if (!ultra.ok) snprintf(t, sizeof(t), "%s", ultra.everSeen ? L("power: assistant offline", "功耗：助手离线") : L("power: connecting", "功耗：连接中"));
+      else if (ultra.watts < 0) snprintf(t, sizeof(t), "%s", L("power --", "功耗 --"));
+      else snprintf(t, sizeof(t), L("power %.0f W", "功耗 %.0f W"), ultra.watts);
+      setLbl(m.uPower, t);
+      lv_obj_set_style_text_color(m.uPower, (ultra.ok && ultra.watts >= 0) ? C_WARN : C_MUT, 0);
+    }
+  } else if (vitals.ok && vitals.vram_total > 0) {
     double used = vitals.vram_total - vitals.vram_free;
+    if (used < 0) used = 0;
     float pct = 100.0 * used / vitals.vram_total;
+    if (pct < 0) pct = 0;
+    if (pct > 100) pct = 100;
     snprintf(t, sizeof(t), "%.1f/%.0fG", used / 1073741824.0, vitals.vram_total / 1073741824.0);
     setBar(m.gBar[0], (int)(pct + 0.5), pct > 88 ? C_ERR : (pct > 70 ? C_WARN : C_ACCENT), m.gVal[0], t);
   } else setBar(m.gBar[0], 0, C_MUT, m.gVal[0], "--");
-  if (vitals.ok && vitals.ram_total > 0) {
-    double used = vitals.ram_total - vitals.ram_free;
-    float pct = 100.0 * used / vitals.ram_total;
-    snprintf(t, sizeof(t), "%.1f/%.0fG", used / 1073741824.0, vitals.ram_total / 1073741824.0);
-    setBar(m.gBar[1], (int)(pct + 0.5), pct > 85 ? C_WARN : C_ACCENT, m.gVal[1], t);
-  } else setBar(m.gBar[1], 0, C_MUT, m.gVal[1], "--");
+  if (!ultraEnabled) {
+    if (vitals.ok && vitals.ram_total > 0) {
+      double used = vitals.ram_total - vitals.ram_free;
+      if (used < 0) used = 0;
+      float pct = 100.0 * used / vitals.ram_total;
+      if (pct < 0) pct = 0;
+      if (pct > 100) pct = 100;
+      snprintf(t, sizeof(t), "%.1f/%.0fG", used / 1073741824.0, vitals.ram_total / 1073741824.0);
+      setBar(m.gBar[1], (int)(pct + 0.5), pct > 85 ? C_WARN : C_ACCENT, m.gVal[1], t);
+    } else setBar(m.gBar[1], 0, C_MUT, m.gVal[1], "--");
+  }
   if (vitals.ok) {
-    setLbl(m.lblGpu, vitals.gpu_name);
+    setLbl(m.lblGpu, vitals.gpu);
+    setGpuMark(m.imgGpu, vitals.gpuVendor);
+    setLbl(m.lblAcc, vitals.accel);
     snprintf(t, sizeof(t), "ComfyUI v%s", vitals.version);
     setLbl(m.lblVer, t);
   } else {
     setLbl(m.lblGpu, "--");
-    setLbl(m.lblVer, serverOk ? L("connected", "已连接") : L("unreachable", "不可达"));
+    setGpuMark(m.imgGpu, 0);
+    setLbl(m.lblAcc, "");
+    setLbl(m.lblVer, serverOk ? L("connected", "已连接") : (stillLinking(everSeen) ? L("connecting...", "连接中…") : L("offline", "离线")));
   }
 
   // log (copy under lock)
@@ -1626,9 +2100,11 @@ bool pullActive() {
   if (nd.ver != lastVer[activeHost]) {
     vitals = nd.vitals;
     run = nd.run;
+    ultra = nd.ultra;
     nJobs = nd.nJobs;
     for (int i = 0; i < nJobs; i++) jobs[i] = nd.jobs[i];
     serverOk = nd.serverOk;
+    everSeen = nd.everSeen;
     nodeTotal = nd.nodeTotal;
     nodesDone = nd.nodesDone;
     nodesCached = nd.nodesCached;
@@ -1639,44 +2115,34 @@ bool pullActive() {
   return changed;
 }
 void switchPage(int idx) {
-  if (dualMode) {
-    if (idx < 0 || idx > 2 || idx == activePageIdx) return;
-    activePageIdx = idx;
+  if (idx < 0 || idx >= pageCount() || idx == activePageIdx) return;
+  activePageIdx = idx;
+  if (useGrid()) {
     activePage = idx;
     lockNet();
-    net[0].wantThumbs = (idx == 2);
-    if (nHosts > 1) net[1].wantThumbs = (idx == 2);
+    for (int i = 0; i < MAX_HOSTS; i++) net[i].wantThumbs = (idx == 2);
     unlockNet();
-    dviewLogVer[0] = dviewLogVer[1] = 0xFFFFFFFFu;
-    for (int k = 0; k < MAX_JOBS; k++) { dviewThumbVer[0][k] = 0xFFFFFFFFu; dviewThumbVer[1][k] = 0xFFFFFFFFu; }
-    pullHost(0);
-    if (nHosts > 1) pullHost(1);
+    for (int h = 0; h < MAX_HOSTS; h++) {
+      dviewLogVer[h] = 0xFFFFFFFFu;
+      for (int k = 0; k < MAX_JOBS; k++) dviewThumbVer[h][k] = 0xFFFFFFFFu;
+    }
+    for (int h = 0; h < nHosts && h < MAX_HOSTS; h++) pullHost(h);
     refreshHeader();
-    if (idx == 0) refreshDualDash();
-    else if (idx == 1) refreshDualLogs();
-    else refreshDualOutputs();
+    if (idx == 0) { if (ultraEnabled) refreshUltraDash(); else refreshGridDash(); }
+    else if (idx == 1) refreshGridLogs();
+    else refreshGridOut();
     refreshClock();
     return;
   }
-  if (idx < 0 || idx >= nHosts * 2 || idx == activePageIdx) return;
-  int host = idx / 2;
-  int page = idx % 2;
-  activePageIdx = idx;
-  activePage = page;
-  bool hostChanged = (host != activeHost);
-  activeHost = host;
-  netActive = host;
-  if (hostChanged) {
-    lastVer[host] = 0xFFFFFFFFu;
-    lastLogVer[host] = 0xFFFFFFFFu;
-    for (int k = 0; k < MAX_JOBS; k++) lastThumbVer[host][k] = 0xFFFFFFFFu;
-  }
+  activeHost = 0;
+  netActive = 0;
+  activePage = idx;
   lockNet();
-  for (int i = 0; i < MAX_HOSTS; i++) net[i].wantThumbs = (i == host && page == 1);
+  net[0].wantThumbs = true;
   unlockNet();
   refreshHeader();
   pullActive();
-  if (page == 0) refreshMonitor();
+  if (idx == 0) refreshMonitor();
   else refreshOutputs();
   refreshClock();
 }
@@ -1827,13 +2293,86 @@ static String urlEnc(const char *s) {
   return o;
 }
 
+// ComfyUI only reports the accelerator through the pytorch build tag, e.g.
+// "2.14.0+rocm10.1.0" -> "ROCm 10.1.0", "2.7.1+cu128" -> "CUDA 12.8".
+static void accelFromTorch(const char *tv, char *out, size_t n) {
+  out[0] = 0;
+  const char *plus = strchr(tv, '+');
+  if (!plus) return;
+  char tag[24];
+  size_t i = 0;
+  for (const char *p = plus + 1; *p && i < sizeof(tag) - 1; p++) { tag[i] = (char)tolower((unsigned char)*p); i++; }
+  tag[i] = 0;
+  const char *name = nullptr;
+  if (!strncmp(tag, "rocm", 4)) name = "ROCm";
+  else if (!strncmp(tag, "cu", 2)) name = "CUDA";
+  else if (!strncmp(tag, "mps", 3)) name = "MPS";
+  else if (!strcmp(tag, "cpu")) name = "CPU";
+  if (!name) return;
+  const char *d = tag;
+  while (*d && !isdigit((unsigned char)*d)) d++;
+  if (!*d) { strlcpy(out, name, n); return; }
+  char vb[16];
+  if (name[0] == 'C' && name[1] == 'U' && name[2] == 'D' && strlen(d) == 3)
+    snprintf(vb, sizeof(vb), "%c%c.%c", d[0], d[1], d[2]);
+  else strlcpy(vb, d, sizeof(vb));
+  snprintf(out, n, "%s %s", name, vb);
+}
+
+// "cuda:0 NVIDIA GeForce RTX 5070 : native" -> vendor 1, "RTX 5070"
+// "cuda:0 AMD Radeon RX 7900 XT : native"   -> vendor 2, "RX 7900 XT"
+static void gpuIdentify(const char *name, char *out, size_t n, uint8_t &vendor) {
+  vendor = 0;
+  out[0] = 0;
+  char up[80];
+  size_t i = 0;
+  for (; name[i] && i < sizeof(up) - 1; i++) up[i] = (char)toupper((unsigned char)name[i]);
+  up[i] = 0;
+  const char *rtx = strstr(up, "RTX"), *gtx = strstr(up, "GTX"), *tesla = strstr(up, "TESLA");
+  const char *rx = strstr(up, "RX"), *vega = strstr(up, "VEGA"), *adeon = strstr(up, "RADEON");
+  if (rtx || gtx || tesla || strstr(up, "NVIDIA") || strstr(up, "GEFORCE")) vendor = 1;
+  else if (rx || vega || adeon || strstr(up, "AMD")) vendor = 2;
+  const char *start = nullptr;
+  if (vendor == 1) start = rtx ? rtx : (gtx ? gtx : (tesla ? tesla : strstr(up, "GEFORCE")));
+  else if (vendor == 2) start = rx ? rx : (vega ? vega : adeon);
+  if (!start) {
+    start = strchr(up, ' ');
+    while (start && *start == ' ') start++;
+  }
+  if (!start) { strlcpy(out, up, n); return; }
+  char tmp[32];
+  size_t k = 0;
+  for (const char *p = start; *p && k < sizeof(tmp) - 4; p++) {
+    if (!strncmp(p, " : NATIVE", 9) || !strncmp(p, "GRAPHICS", 8) || !strncmp(p, "SERIES", 6)) break;
+    tmp[k++] = *p;
+  }
+  tmp[k] = 0;
+  // keep only the model tokens: drop marketing words after the number
+  // ("RTX 5070 LAPTOP GPU" -> "RTX 5070", "RX 7900 XT" stays)
+  bool seenDigit = false;
+  char *gap = nullptr;
+  for (char *q = tmp; *q; q++) {
+    if (isdigit((unsigned char)*q)) seenDigit = true;
+    if (seenDigit && *q == ' ') { gap = q; break; }
+  }
+  if (gap) {
+    char *r = gap + 1;
+    char *r2 = strchr(r, ' ');
+    size_t rl = r2 ? (size_t)(r2 - r) : strlen(r);
+    if (rl > 3) *gap = 0;
+  }
+  k = strlen(tmp);
+  while (k && (tmp[k - 1] == ' ' || tmp[k - 1] == ':')) tmp[--k] = 0;
+  strlcpy(out, tmp, n);
+}
+
 // ---------- worker fetchers ----------
 void fetchVitals(NetData &nd) {
   String b;
   if (!httpGet(nd, "/system_stats", b)) {
-    bool wasOk;
-    lockNet(); wasOk = nd.serverOk; if (nd.lastPollOk && millis() - nd.lastPollOk > 20000) { nd.serverOk = false; } bump(nd); unlockNet();
-    if (wasOk && !nd.serverOk) logEvent(nd, L("server unreachable", "服务器不可达"));
+    bool wentOff;
+    lockNet(); wentOff = markOfflineLocked(nd, millis()); bump(nd); unlockNet();
+    if (wentOff) logEvent(nd, L("server unreachable", "服务器不可达"));
     return;
   }
   Vitals v;
@@ -1844,12 +2383,16 @@ void fetchVitals(NetData &nd) {
   v.vram_free = jnum(s, "vram_free");
   const char *dev = strstr(s, "\"devices\"");
   jstr(v.gpu_name, sizeof(v.gpu_name), dev ? dev : s, "name");
+  gpuIdentify(v.gpu_name, v.gpu, sizeof(v.gpu), v.gpuVendor);
   jstr(v.version, sizeof(v.version), s, "comfyui_version");
+  char tv[48];
+  jstr(tv, sizeof(tv), s, "pytorch_version");
+  accelFromTorch(tv, v.accel, sizeof(v.accel));
   v.ok = true;
   bool cameBack;
   lockNet();
   cameBack = !nd.serverOk;
-  nd.vitals = v; nd.serverOk = true; nd.lastPollOk = millis(); bump(nd);
+  nd.vitals = v; markSeenLocked(nd); bump(nd);
   unlockNet();
   if (cameBack) logEvent(nd, L("server back", "服务器恢复"));
 }
@@ -1897,12 +2440,63 @@ void fetchQueue(NetData &nd) {
     nd.nodesDone = 0;
     nd.nodesCached = 0;
   }
-  nd.serverOk = true; nd.lastPollOk = millis(); bump(nd);
+  markSeenLocked(nd); bump(nd);
+  unlockNet();
+}
+// nullable number: -1 (def) when the key is absent or JSON null
+static double jnumN(const char *s, const char *key, double def = -1) {
+  const char *v = keyVal(s, key);
+  if (!v) return def;
+  v = sp(v);
+  if (!strncmp(v, "null", 4)) return def;
+  return strtod(v, nullptr);
+}
+// Ultra hardware vitals from the on-host assistant (port A). Independent of the
+// 8188 serverOk flag: the assistant can be down while ComfyUI runs, or vice versa.
+void fetchUltra(NetData &nd) {
+  HTTPClient c;
+  c.setConnectTimeout(1200);
+  c.setTimeout(3000);
+  String url = "http://" + String(nd.host) + ":" + String(ultraPort) + "/api/panel";
+  String b;
+  bool got = false;
+  if (c.begin(url)) {
+    int code = c.GET();
+    if (code == 200) { b = c.getString(); got = true; }
+    c.end();
+  }
+  lockNet();
+  Ultra &u = nd.ultra;
+  if (got) {
+    const char *s = b.c_str();
+    u.cpu = (int)jnumN(s, "cpu");
+    u.ram = (int)jnumN(s, "ram");
+    u.vram = (int)jnumN(s, "vram");
+    u.watts = (float)jnumN(s, "w");
+    u.cpuTemp = (float)jnumN(s, "cpu_temp");
+    const char *g = strstr(s, "\"gpu\"");
+    if (g) {
+      double gu = jnumN(g, "util");
+      u.gpu = gu < 0 ? -1 : (int)gu;
+      u.gpuTemp = (float)jnumN(g, "temp");
+      jstr(u.gpuName, sizeof(u.gpuName), g, "name");
+      char vend[12];
+      jstr(vend, sizeof(vend), g, "vendor");
+      u.gpuVendor = !strcmp(vend, "nvidia") ? 1 : (!strcmp(vend, "amd") ? 2 : 0);
+    }
+    u.ok = true; u.everSeen = true; u.lastSeen = millis();
+  } else if (u.ok && millis() - u.lastSeen > offlineMs()) {
+    u.ok = false;
+    u.cpu = u.gpu = u.ram = u.vram = -1;
+    u.watts = u.gpuTemp = u.cpuTemp = -1;
+  }
+  bump(nd);
   unlockNet();
 }
 void fetchHistory(NetData &nd) {
   String b;
   if (!httpGet(nd, "/history?max_items=8", b)) return;
+  lockNet(); markSeenLocked(nd); bump(nd); unlockNet();
   const char *s = b.c_str();
   size_t len = b.length();
   size_t starts[8];
@@ -2097,15 +2691,16 @@ void fetchJobThumb(NetData &nd, int k) {
 }
 
 // ================= websocket =================
-WebSocketsClient wsA, wsB;
-bool wsOnA = false, wsOnB = false;
-char wsIdA[40] = "esp32panel", wsIdB[40] = "esp32panel";
-uint32_t lastRebindA = 0, lastRebindB = 0;
+typedef void (*WsCb)(WStype_t, uint8_t *, size_t);
+WebSocketsClient wsCl[MAX_HOSTS];
+bool wsOn[MAX_HOSTS] = {false, false, false, false};
+char wsId[MAX_HOSTS][40] = {"esp32panel", "esp32panel", "esp32panel", "esp32panel"};
+uint32_t lastRebind[MAX_HOSTS] = {0, 0, 0, 0};
 
 float fv(JsonVariant v) { return v.is<float>() || v.is<int>() ? v.as<float>() : -1.0f; }
 
 void wsEventFor(int slot, WStype_t type, uint8_t *pl, size_t len) {
-  int idx = dualMode ? slot : activeHost;
+  int idx = slot;
   if (idx < 0 || idx >= nHosts) return;
   NetData &nd = net[idx];
   if (type == WStype_DISCONNECTED) {
@@ -2250,75 +2845,78 @@ void wsEventFor(int slot, WStype_t type, uint8_t *pl, size_t len) {
   bump(nd);
   unlockNet();
 }
-void wsEventA(WStype_t t, uint8_t *p, size_t l) { wsEventFor(0, t, p, l); }
-void wsEventB(WStype_t t, uint8_t *p, size_t l) { wsEventFor(1, t, p, l); }
+void wsEvent0(WStype_t t, uint8_t *p, size_t l) { wsEventFor(0, t, p, l); }
+void wsEvent1(WStype_t t, uint8_t *p, size_t l) { wsEventFor(1, t, p, l); }
+void wsEvent2(WStype_t t, uint8_t *p, size_t l) { wsEventFor(2, t, p, l); }
+void wsEvent3(WStype_t t, uint8_t *p, size_t l) { wsEventFor(3, t, p, l); }
+static const WsCb wsEv[MAX_HOSTS] = {wsEvent0, wsEvent1, wsEvent2, wsEvent3};
 
+// slot == host: every configured server gets its own websocket so the
+// client_id follow-up works for all of them at once.
 void wsBindSlot(int slot, int h) {
-  WebSocketsClient &c = (slot == 0) ? wsA : wsB;
-  bool &on = (slot == 0) ? wsOnA : wsOnB;
-  char *idbuf = (slot == 0) ? wsIdA : wsIdB;
+  if (slot < 0 || slot >= MAX_HOSTS) return;
+  WebSocketsClient &c = wsCl[slot];
+  bool &on = wsOn[slot];
   if (on) { c.disconnect(); on = false; }
   if (h < 0 || h >= nHosts || !net[h].host[0]) return;
   const char *idp = net[h].promptClient[0] ? net[h].promptClient : "esp32panel";
-  strlcpy(idbuf, idp, 40);
+  strlcpy(wsId[slot], idp, 40);
   char path[80];
-  snprintf(path, sizeof(path), "/ws?clientId=%s", idbuf);
+  snprintf(path, sizeof(path), "/ws?clientId=%s", idp);
   c.begin(net[h].host, net[h].port, path, "arduino");
-  c.onEvent(slot == 0 ? wsEventA : wsEventB);
+  c.onEvent(wsEv[slot]);
   c.setReconnectInterval(3000);
   on = true;
 }
 void wsStopAll() {
-  if (wsOnA) { wsA.disconnect(); wsOnA = false; }
-  if (wsOnB) { wsB.disconnect(); wsOnB = false; }
+  for (int i = 0; i < MAX_HOSTS; i++) {
+    if (wsOn[i]) { wsCl[i].disconnect(); wsOn[i] = false; }
+  }
 }
 
+static int shownJobs() { return useGrid() ? cellJobs() : MAX_JOBS; }
+
 void netTask(void *) {
-  int boundA = -1;
-  int boundB = -1;
+  int bound[MAX_HOSTS] = {-1, -1, -1, -1};
   uint32_t epoch = 0xFFFFFFFFu;
   for (;;) {
     uint32_t ms = millis();
     if (wst == W_ONLINE && nHosts > 0) {
-      int hosts = dualMode ? (nHosts > 1 ? 2 : 1) : 1;
-      int hostA = dualMode ? 0 : activeHost;
-      int hostB = 1;
-      if (epoch != netEpoch || boundA != hostA) {
-        epoch = netEpoch; boundA = hostA;
-        wsBindSlot(0, hostA);
-        net[hostA].tV = net[hostA].tQ = net[hostA].tH = 0;
+      if (epoch != netEpoch) {
+        epoch = netEpoch;
+        for (int h = 0; h < MAX_HOSTS; h++) {
+          bound[h] = -1;
+          net[h].tV = net[h].tQ = net[h].tH = net[h].tU = 0;
+        }
       }
-      if (dualMode && hosts > 1 && (boundB != hostB)) {
-        boundB = hostB;
-        wsBindSlot(1, hostB);
-        net[hostB].tV = net[hostB].tQ = net[hostB].tH = 0;
+      for (int h = 0; h < nHosts && h < MAX_HOSTS; h++) {
+        if (bound[h] != h) { bound[h] = h; wsBindSlot(h, h); }
       }
-      for (int hi = 0; hi < hosts; hi++) {
-        int h = dualMode ? hi : hostA;
+      for (int h = 0; h < nHosts && h < MAX_HOSTS; h++) {
         NetData &nd = net[h];
         if (nd.run.running && ms - nd.lastHeartbeat > 15000) {
           nd.lastHeartbeat = ms;
           uint32_t secs = nd.run.start_ms ? (ms - nd.run.start_ms) / 1000 : 0;
           logEvent(nd, L("running %02u:%02u", "运行中 %02u:%02u"), (unsigned)(secs / 60), (unsigned)(secs % 60));
         }
-        if (!nd.tV || ms - nd.tV > 3000) { nd.tV = ms; fetchVitals(nd); }
-        if (!nd.tQ || ms - nd.tQ > 2000) { nd.tQ = ms; fetchQueue(nd); }
+        if (!nd.tV || ms - nd.tV > pollVitalsMs()) { nd.tV = ms; fetchVitals(nd); }
+        if (!nd.tQ || ms - nd.tQ > pollQueueMs()) { nd.tQ = ms; fetchQueue(nd); }
+        if (ultraEnabled && (!nd.tU || ms - nd.tU > 2500)) { nd.tU = ms; fetchUltra(nd); }
         if (!nd.tH || ms - nd.tH > 20000) { nd.tH = ms; fetchHistory(nd); }
-        int slot = dualMode ? h : 0;
-        char *curId = (slot == 0) ? wsIdA : wsIdB;
-        uint32_t &rb = (slot == 0) ? lastRebindA : lastRebindB;
-        if (nd.run.running && nd.promptClient[0] && strcmp(nd.promptClient, curId) && ms - rb > 1500) {
-          rb = ms;
+        if (nd.run.running && nd.promptClient[0] && strcmp(nd.promptClient, wsId[h]) && ms - lastRebind[h] > 1500) {
+          lastRebind[h] = ms;
           logEvent(nd, L("follow %s", "跟随 %s"), nd.promptClient);
-          wsBindSlot(slot, h);
+          wsBindSlot(h, h);
         }
-        if (nd.wantThumbs && ms - nd.lastThumbTry > 1200) {
+        int maxK = shownJobs();
+        if (maxK > nd.nJobs) maxK = nd.nJobs;
+        if (nd.serverOk && nd.wantThumbs && ms - nd.lastThumbTry > 1200) {
           nd.lastThumbTry = ms;
           for (int n = 0; n < MAX_JOBS && n < nd.nJobs; n++) {
             int k = nd.thumbScan % MAX_JOBS;
             nd.thumbScan++;
             if (k >= nd.nJobs) continue;
-            if (dualMode && k >= 2) { nd.thumbState[k] = 3; continue; }
+            if (k >= shownJobs()) { nd.thumbState[k] = 3; continue; }
             if (!thumbSource(nd.jobs[k])) { nd.thumbState[k] = 3; continue; }
             if (nd.thumbState[k] == 1) continue;
             if (nd.thumbState[k] == 2 && (int32_t)(ms - nd.thumbAt[k]) < 0) continue;
@@ -2326,9 +2924,7 @@ void netTask(void *) {
             break;
           }
         }
-        if (nd.wantThumbs && ms - nd.lastSizeTry > 1500) {
-          int maxK = dualMode ? 2 : MAX_JOBS;
-          if (maxK > nd.nJobs) maxK = nd.nJobs;
+        if (nd.serverOk && nd.wantThumbs && ms - nd.lastSizeTry > 1500) {
           for (int k = 0; k < maxK; k++) {
             Job &j = nd.jobs[k];
             if (j.sizeKnown || j.videoSec <= 0.05f || !isVideoFile(j.file)) continue;
@@ -2346,15 +2942,15 @@ void netTask(void *) {
           }
         }
       }
-      if (wsOnA) wsA.loop();
-      if (dualMode && wsOnB) wsB.loop();
+      for (int h = 0; h < nHosts && h < MAX_HOSTS; h++) if (wsOn[h]) wsCl[h].loop();
     } else {
       wsStopAll();
-      boundA = -1; boundB = -1;
+      for (int h = 0; h < MAX_HOSTS; h++) bound[h] = -1;
     }
     vTaskDelay(pdMS_TO_TICKS(8));
   }
 }
+
 
 // ================= WiFi =================
 void startConnect() {
@@ -2467,7 +3063,7 @@ void setup() {
   });
   shotSrv.on("/debug/page", HTTP_GET, []() {
     int i = shotSrv.arg("i").toInt();
-    if (i >= 0 && i < nHosts * 2 && i != activePageIdx) {
+    if (i >= 0 && i < pageCount() && i != activePageIdx) {
       switchPage(i);
       if (tileView) lv_obj_set_tile_id(tileView, i, 0, LV_ANIM_OFF);
     }
@@ -2485,11 +3081,24 @@ void setup() {
     shotSrv.send(200, "text/plain", "rebooting");
     delay(200); ESP.restart();
   });
-  shotSrv.on("/debug/dual", HTTP_GET, []() {
-    bool on = shotSrv.arg("on").toInt() != 0;
-    prefs.begin("cfg", false); prefs.putBool("dual", on); prefs.end();
-    shotSrv.send(200, "text/plain", "rebooting");
-    delay(200); ESP.restart();
+  shotSrv.on("/debug/ultra", HTTP_GET, []() {
+    if (shotSrv.hasArg("i")) ultraEnabled = shotSrv.arg("i").toInt() != 0;
+    else ultraEnabled = !ultraEnabled;
+    if (shotSrv.hasArg("p")) { int p = shotSrv.arg("p").toInt(); if (p > 0 && p <= 65535) ultraPort = p; }
+    saveCfg();
+    if (nHosts > 0 && wst == W_ONLINE) { buildDashboard(); lv_scr_load(scrDash); netEpoch++; }
+    shotSrv.send(200, "text/plain", ultraEnabled ? "ultra on" : "ultra off");
+  });
+  shotSrv.on("/debug/delhost", HTTP_GET, []() {
+    int i = shotSrv.arg("i").toInt();
+    if (i >= 0 && i < nHosts && i < MAX_HOSTS) {
+      for (int k = i; k < MAX_HOSTS - 1; k++) { hostStr[k] = hostStr[k + 1]; hostPort[k] = hostPort[k + 1]; }
+      hostStr[MAX_HOSTS - 1] = "";
+      hostPort[MAX_HOSTS - 1] = DEFAULT_PORT;
+      nHosts--;
+      applyHostsAndShow();
+      shotSrv.send(200, "text/plain", "ok");
+    } else shotSrv.send(400, "text/plain", "bad");
   });
   shotSrv.on("/debug/thumb", HTTP_GET, []() {
     lockNet();
@@ -2502,29 +3111,41 @@ void setup() {
     unlockNet();
     shotSrv.send(200, "text/plain", "ok");
   });
+  shotSrv.on("/debug/host", HTTP_GET, []() {
+    int i = shotSrv.arg("i").toInt();
+    String h = shotSrv.arg("h");
+    if (i >= 0 && i < MAX_HOSTS && h.length()) {
+      parseHost(i, h);
+      if (i >= nHosts) nHosts = i + 1;
+      applyHostsAndShow();
+      shotSrv.send(200, "text/plain", "ok");
+    } else shotSrv.send(400, "text/plain", "bad");
+  });
   shotSrv.on("/debug/addhost", HTTP_GET, []() {
     String h = shotSrv.arg("h");
     if (h.length() && nHosts < MAX_HOSTS) {
       parseHost(nHosts, h);
       nHosts++;
-      saveCfg();
-      netConfigure();
-      buildDashboard();
-      netEpoch++;
+      applyHostsAndShow();
     }
     shotSrv.send(200, "text/plain", "ok");
   });
   shotSrv.on("/stats", HTTP_GET, []() {
-    int srv = serverOk, ws = run.connected, rn = run.running, q = run.pending;
-    if (dualMode) {
-      srv = dview[0].serverOk && (nHosts < 2 || dview[1].serverOk);
-      ws = net[0].run.connected || (nHosts > 1 && net[1].run.connected);
-      rn = dview[0].run.running || (nHosts > 1 && dview[1].run.running);
-      q = dview[0].run.pending + (nHosts > 1 ? dview[1].run.pending : 0);
+    int on = 0, ws = 0, rn = 0, q = 0, seen = 1;
+    for (int h = 0; h < nHosts && h < MAX_HOSTS; h++) {
+      if (dview[h].serverOk) on++;
+      if (net[h].run.connected) ws = 1;
+      if (dview[h].run.running) rn = 1;
+      q += dview[h].run.pending;
+      if (!dview[h].everSeen) seen = 0;
     }
+    int srv;
+    if (useGrid()) srv = (on == nHosts) ? 1 : 0;
+    else { srv = (int)serverOk; ws = (int)run.connected; rn = (int)run.running; q = run.pending; seen = (int)everSeen; }
     char b[224];
-    snprintf(b, sizeof(b), "{\"wifi\":%d,\"server\":%d,\"ws\":%d,\"running\":%d,\"pending\":%d,\"host\":%d,\"page\":%d,\"dual\":%d,\"heap\":%u,\"ui_max_ms\":%u}",
-             (int)wst, srv, ws, rn, q, activeHost, activePageIdx, (int)dualMode,
+    snprintf(b, sizeof(b), "{\"wifi\":%d,\"server\":%d,\"ws\":%d,\"running\":%d,\"pending\":%d,\"hosts\":%d,\"on\":%d,\"cols\":%d,\"rows\":%d,\"page\":%d,\"seen\":%d,\"up\":%lu,\"rst\":%d,\"heap\":%u,\"ui_max_ms\":%u}",
+             (int)wst, srv, ws, rn, q, nHosts, on, gridCols(), gridRows(), activePageIdx, seen,
+             (unsigned long)(millis() / 1000), (int)esp_reset_reason(),
              ESP.getFreeHeap(), (unsigned)(uiMaxUs / 1000));
     shotSrv.send(200, "application/json", b);
   });
@@ -2569,12 +3190,11 @@ void loop() {
 
   if (scrDash && lv_scr_act() == scrDash && ms - tPull > 150) {
     tPull = ms;
-    if (dualMode) {
-      pullHost(0);
-      if (nHosts > 1) pullHost(1);
-      if (activePageIdx == 0) refreshDualDash();
-      else if (activePageIdx == 1) refreshDualLogs();
-      else refreshDualOutputs();
+    if (useGrid()) {
+      for (int h = 0; h < nHosts && h < MAX_HOSTS; h++) pullHost(h);
+      if (activePageIdx == 0) { if (ultraEnabled) refreshUltraDash(); else refreshGridDash(); }
+      else if (activePageIdx == 1) refreshGridLogs();
+      else refreshGridOut();
       refreshHeader();
     } else {
       bool changed = pullActive();

@@ -11,3 +11,12 @@ build/
 # Local assets (generated on demand)
 tools/fonts/*.otf
 tools/samples/
+
+# Assistant runtime state (per-host config, generated on first save)
+assistant/assistant_config.json
+assistant/assistant_config.json.tmp
+assistant/nohup.out
+
+# Python caches
+__pycache__/
+*.pyc

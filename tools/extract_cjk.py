@@ -6,6 +6,6 @@ import sys
 
 src = pathlib.Path(sys.argv[1] if len(sys.argv) > 1 else "firmware/comfyui_panel/comfyui_panel.ino").read_text()
 cjk = set(re.findall(r"[\u4e00-\u9fff]", src))
-extra = set("，。…·（）→：、")
+extra = set("，。…·（）→：、、「」《》？！；")
 ascii_range = "".join(chr(c) for c in range(0x20, 0x7F))
 sys.stdout.write("".join(sorted(cjk | extra)) + ascii_range)
