@@ -1,7 +1,14 @@
 @echo off
-rem ComfyUI 看板助手 — Windows 启动脚本
-rem 请在本机桌面双击运行（或放入「启动」文件夹）。不要在 SSH 会话里常驻。
+rem ComfyUI panel assistant launcher.
+rem Prefer the packaged exe (tray + status window); fall back to running the source.
+rem NOTE: keep this file ASCII-only - cmd reads .bat as GBK and mangles UTF-8 Chinese.
 cd /d "%~dp0"
+
+if exist "%~dp0ComfyUIPanelAssistant.exe" (
+  start "" "%~dp0ComfyUIPanelAssistant.exe" %*
+  exit /b 0
+)
+
 if "%ASSISTANT_PORT%"=="" set ASSISTANT_PORT=8189
 python assistant.py --port %ASSISTANT_PORT% %*
 pause

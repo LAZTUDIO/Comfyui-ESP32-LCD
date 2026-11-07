@@ -312,6 +312,26 @@ python3 assistant.py --port 8189          # 或 ./start.sh / start.bat
 - 境界徽章按 GPU 负载映射：凡尘/辟谷/炼气/筑基/金丹/元婴/化神。
 - 已在 Mac 浏览器验证渲染与交互、无 JS 控制台报错。
 
+### 6.8 桌面版单文件 exe（托盘，2026-11-07 新增）
+
+用户诉求：「双击要有反应，能最小化到状态栏」。入口是 `assistant/tray_app.py`，
+采集/HTTP/WebUI 全部复用 `assistant.py`（只加了 `make_state()` / `make_server()` 两个工厂函数）。
+
+- **打包**：`tools\build_exe.bat` → `assistant\dist\ComfyUIPanelAssistant.exe`（onefile + windowed，约 29.5 MB）。
+- **运行时路径**（关键，打包后不能再按 `__file__` 算）：
+  - `APP_DIR` = exe 所在目录 → `assistant_config.json`、`assistant.log` 都落这里，重启不丢；
+  - `RES_DIR` = `sys._MEIPASS` → `webui.html` 打包进 exe，但同目录若有 `webui.html` 优先用它（方便现场改）。
+- **行为**：点 X 或最小化 → 收进托盘；托盘双击/「显示窗口」→ 恢复；菜单含打开看板、复制地址、退出。
+- **单实例**：不用命名互斥体——ctypes 读 `GetLastError()` 实测会误判"已有实例"，改成探测
+  `http://127.0.0.1:<port>/api/health` 的 `version` 字段。
+- **窗口可能被建成最小化**：用 explorer/任务计划启动时 `STARTUPINFO` 会带 SHOWMINIMIZED，
+  所以建窗后强制 `state("normal") + deiconify + lift + 置顶 1.5s`。
+- **日志**：`--windowed` 下 `sys.stdout` 是 `None`，任何 print 都会炸。启动时重定向到
+  `assistant.log`，并装 `sys.excepthook` 把未捕获异常写进日志——否则就是"双击没反应"。
+- **托盘图标默认在 `^` 折叠区**（Win11 对新图标默认隐藏），需要用户拖出来固定一次。
+- **`.bat` 必须纯 ASCII**：UTF-8 中文注释会被 cmd 按 GBK 解析，导致 `rem` 行残片被当命令执行。
+- 依赖：`pystray` + `Pillow`（构建机需 `pip install pystray`；`python -m PyInstaller` 需 6.x）。
+
 ---
 
 ## 7. 联调与测试方法

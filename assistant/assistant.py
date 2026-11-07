@@ -34,12 +34,21 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 IS_WIN = os.name == "nt"
 HERE = os.path.dirname(os.path.abspath(__file__))
-VERSION = "1.0.1"
+FROZEN = bool(getattr(sys, "frozen", False))
+# 打包成 exe 后：只读资源解到 sys._MEIPASS（临时目录），
+# 配置文件必须落在 exe 旁边，否则每次重启都丢配置。
+APP_DIR = os.path.dirname(os.path.abspath(sys.executable)) if FROZEN else HERE
+RES_DIR = getattr(sys, "_MEIPASS", HERE)
+VERSION = "1.1.0"
 DEFAULT_PORT = 8189
 HISTORY_LEN = 300          # 5 分钟 @1s
 LOG_LINES = 400
 
-CFG_PATH = os.path.join(HERE, "assistant_config.json")
+CFG_PATH = os.path.join(APP_DIR, "assistant_config.json")
+# WebUI 优先用同目录的（方便改），没有就用打包进 exe 的那份
+WEBUI_PATH = os.path.join(APP_DIR, "webui.html")
+if not os.path.exists(WEBUI_PATH):
+    WEBUI_PATH = os.path.join(RES_DIR, "webui.html")
 DEFAULT_CFG = {
     "comfy_url": "http://127.0.0.1:8188",
     "workdir": "",
@@ -1163,7 +1172,7 @@ class Handler(BaseHTTPRequestHandler):
         path = self.path.split("?", 1)[0]
         st = self.state
         if path in ("/", "/index.html"):
-            html_path = os.path.join(HERE, "webui.html")
+            html_path = WEBUI_PATH
             try:
                 with open(html_path, "rb") as f:
                     self._send(200, f.read(), "text/html; charset=utf-8")
@@ -1214,6 +1223,33 @@ class Handler(BaseHTTPRequestHandler):
             self._send(404, '{"error":"not found"}')
 
 
+def make_state(cfg, port):
+    """构造采集状态机（CLI 与托盘 exe 共用）。"""
+    state = State(cfg)
+    state.listen_port = port
+    return state
+
+
+class PanelServer(ThreadingHTTPServer):
+    """客户端断开（刷新页面/浏览器取消）是常态，不要往日志里刷 traceback。"""
+    daemon_threads = True
+
+    def handle_error(self, request, client_address):
+        import sys as _sys
+        et = _sys.exc_info()[0]
+        if et in (ConnectionAbortedError, ConnectionResetError, BrokenPipeError):
+            return
+        super().handle_error(request, client_address)
+
+
+def make_server(state, port, bind="0.0.0.0"):
+    """构造 HTTP 服务（CLI 与托盘 exe 共用）。"""
+    Handler.state = state
+    srv = PanelServer((bind, port), Handler)
+    srv.daemon_threads = True
+    return srv
+
+
 def main():
     ap = argparse.ArgumentParser(description="ComfyUI 看板助手")
     ap.add_argument("--port", type=int, default=None, help="助手监听端口 A（默认 8189）")
@@ -1234,16 +1270,13 @@ def main():
     cfg["port"] = port
 
     detect_session_warning()
-    state = State(cfg)
-    state.listen_port = port
-    Handler.state = state
+    state = make_state(cfg, port)
 
     stop_evt = threading.Event()
     th = threading.Thread(target=sampler_loop, args=(state, stop_evt), daemon=True)
     th.start()
 
-    srv = ThreadingHTTPServer((args.bind, port), Handler)
-    srv.daemon_threads = True
+    srv = make_server(state, port, args.bind)
     print("ComfyUI 看板助手 v%s" % VERSION)
     print("  WebUI / API : http://%s:%d/" % (args.bind, port))
     print("  ESP32 panel : http://<本机IP>:%d/api/panel" % port)

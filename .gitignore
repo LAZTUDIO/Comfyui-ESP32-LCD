@@ -19,6 +19,13 @@ tools/samples/
 assistant/assistant_config.json
 assistant/assistant_config.json.tmp
 assistant/nohup.out
+assistant/assistant.log
+assistant/app.ico
+
+# PyInstaller（tools/build_exe.bat 的产物）
+assistant/build/
+assistant/dist/
+assistant/*.spec
 
 # Python caches
 __pycache__/
