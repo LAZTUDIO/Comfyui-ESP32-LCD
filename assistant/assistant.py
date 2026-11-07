@@ -34,7 +34,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 IS_WIN = os.name == "nt"
 HERE = os.path.dirname(os.path.abspath(__file__))
-VERSION = "1.0.0"
+VERSION = "1.0.1"
 DEFAULT_PORT = 8189
 HISTORY_LEN = 300          # 5 分钟 @1s
 LOG_LINES = 400
@@ -592,14 +592,16 @@ class DiskNet:
         now = time.time()
         dt = now - self.prev_t if self.prev_t else None
         self.prev_t = now
-        try:
-            st = os.statvfs(self.workdir)
-            total = st.f_blocks * st.f_frsize
-            free = st.f_bavail * st.f_frsize
-            out["disk"] = {"path": self.workdir, "total": total, "free": free,
-                           "pct": round(100.0 * (total - free) / total, 1) if total else None}
-        except OSError:
-            pass
+        # os.statvfs 只在 POSIX 存在；Windows 的磁盘容量由 _win_io 用 GetDiskFreeSpaceExW 取
+        if not IS_WIN:
+            try:
+                st = os.statvfs(self.workdir)
+                total = st.f_blocks * st.f_frsize
+                free = st.f_bavail * st.f_frsize
+                out["disk"] = {"path": self.workdir, "total": total, "free": free,
+                               "pct": round(100.0 * (total - free) / total, 1) if total else None}
+            except (OSError, AttributeError):
+                pass
         if IS_WIN:
             self._win_io(out, dt)
         else:
