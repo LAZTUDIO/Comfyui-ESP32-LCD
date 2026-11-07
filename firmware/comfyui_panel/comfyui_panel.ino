@@ -1245,9 +1245,9 @@ static void hostStateText(const HostView &v, char *state, size_t n, lv_color_t &
     strlcpy(state, linking ? L("LINKING", "连接中") : L("OFFLINE", "离线"), n);
     col = linking ? C_WARN : C_ERR;
   }
-  else if (v.run.running) { strlcpy(state, L("GENERATING", "生成中"), n); col = C_OK; }
+  else if (v.run.running) { strlcpy(state, L("RENDERING", "渲染中"), n); col = C_ACCENT; }
   else if (v.run.pending > 0) { strlcpy(state, L("QUEUED", "排队中"), n); col = C_WARN; }
-  else { strlcpy(state, L("IDLE", "空闲"), n); col = C_ACCENT; }
+  else { strlcpy(state, L("IDLE", "空闲"), n); col = C_OK; }
 }
 
 // compact one-word form for the log header rows, where the ip needs the room
@@ -1258,10 +1258,117 @@ static const char *hostStateShort(const HostView &v, lv_color_t &col) {
     col = linking ? C_WARN : C_ERR;
     return linking ? L("LINK", "连接") : L("OFF", "离线");
   }
-  if (v.run.running) { col = C_OK; return L("RUN", "生成"); }
+  if (v.run.running) { col = C_ACCENT; return L("RENDER", "渲染"); }
   if (v.run.pending > 0) { col = C_WARN; return L("QUEUE", "排队"); }
-  col = C_ACCENT;
+  col = C_OK;
   return L("IDLE", "空闲");
+}
+
+// ================= 渲染中特效（15fps 轻量） =================
+// LVGL 8 做不出 CSS 那种 backdrop-filter / conic-gradient，等价物是：
+//   1. 逐字符 recolor 的渐变流光状态字（≈ CSS gradient text）
+//   2. 进度条指示条色相循环（aurora bar）
+//   3. 状态字底板 + 阴影宽度三角波呼吸（≈ box-shadow / text-shadow pulse）
+// 每帧只改几个样式值，失效区域只有状态字和进度条，不重绘整卡。
+static bool fxActive[MAX_HOSTS] = {false};
+static lv_timer_t *fxTimer = nullptr;
+
+static uint16_t fxHue(int h, uint32_t ms) { return (uint16_t)(((ms / 9) + h * 137) % 360); }
+
+static lv_color_t fxNeon(int h, uint32_t ms) {
+  return lv_color_hsv_to_rgb(fxHue(h, ms), 92, 100);
+}
+
+static void fxHex(lv_color_t c, char *out) {  // RGB565 -> "#RRGGBB "（recolor 语法）
+  uint8_t r = (uint8_t)((c.ch.red * 255 + 15) / 31);
+  uint8_t g = (uint8_t)((c.ch.green * 255 + 31) / 63);
+  uint8_t b = (uint8_t)((c.ch.blue * 255 + 15) / 31);
+  sprintf(out, "#%02X%02X%02X ", r, g, b);
+}
+
+// 状态字：中文逐字渐变 + 三角波亮度呼吸；英文整体流光
+static void fxStateText(int h, uint32_t ms, char *out, size_t n) {
+  const char *s = L("RENDERING", "渲染中");
+  char col[16];
+  if (s[0] & 0x80) {                       // UTF-8 中文：逐字上色
+    const char *p = s;
+    int seg = 0;
+    out[0] = 0;
+    while (*p && seg < 8) {
+      int len = (p[0] & 0x20) ? 3 : 1;     // CJK 三字节，其余单字节
+      uint16_t hue = (uint16_t)((fxHue(h, ms) + seg * 28) % 360);
+      uint16_t ph = (uint16_t)(((ms / 7) + seg * 120) % 240);
+      int tri = ph < 120 ? ph : 240 - ph;  // 0..120 三角波
+      lv_color_t c = lv_color_hsv_to_rgb(hue, 90, 70 + (tri * 30) / 120);
+      fxHex(c, col);
+      strlcat(out, col, n);
+      strncat(out, p, len);
+      strlcat(out, "#", n);
+      p += len;
+      seg++;
+    }
+  } else {
+    lv_color_t c = fxNeon(h, ms);
+    fxHex(c, col);
+    snprintf(out, n, "%s%s#", col, s);
+  }
+}
+
+// 特效结束：恢复静态状态字（文字/颜色立即正确，不等 1s 轮询）
+static void fxSetPlain(const HostView &v, lv_obj_t *l) {
+  if (!l) return;
+  lv_label_set_recolor(l, false);
+  char st[24];
+  lv_color_t col;
+  hostStateText(v, st, sizeof(st), col);
+  const char *cur = lv_label_get_text(l);
+  if (!cur || strcmp(cur, st)) lv_label_set_text(l, st);
+  lv_obj_set_style_text_color(l, col, 0);
+  lv_obj_set_style_shadow_width(l, 0, 0);
+  lv_obj_set_style_bg_opa(l, LV_OPA_TRANSP, 0);
+}
+
+static void fxApply(lv_obj_t *state, lv_obj_t *bar, int h, uint32_t ms) {
+  if (!state) return;
+  char txt[96];
+  fxStateText(h, ms, txt, sizeof(txt));
+  lv_label_set_recolor(state, true);
+  setLbl(state, txt);
+  lv_obj_set_style_text_color(state, C_TXT, 0);
+  // 霓虹底牌 + 呼吸辉光：底板让阴影有形，阴影宽度三角波 2..18px
+  lv_obj_set_style_bg_color(state, lv_color_hex(TH.card), 0);
+  lv_obj_set_style_bg_opa(state, LV_OPA_90, 0);
+  lv_obj_set_style_radius(state, 8, 0);
+  lv_obj_set_style_pad_hor(state, 6, 0);
+  lv_obj_set_style_pad_ver(state, 1, 0);
+  lv_obj_set_style_shadow_color(state, fxNeon(h, ms + 500), 0);
+  lv_obj_set_style_shadow_opa(state, LV_OPA_COVER, 0);
+  uint16_t ph = (uint16_t)(((ms / 6) + h * 80) % 200);
+  int tri = ph < 100 ? ph : 200 - ph;
+  lv_obj_set_style_shadow_width(state, 2 + tri / 8, 0);
+  if (bar) lv_obj_set_style_bg_color(bar, fxNeon(h, ms), LV_PART_INDICATOR);
+}
+
+static void fxTick(lv_timer_t *t) {
+  (void)t;
+  uint32_t ms = millis();
+  for (int h = 0; h < nHosts && h < MAX_HOSTS; h++) {
+    const HostView &v = dview[h];
+    bool on = (wst == W_ONLINE) && v.serverOk && v.run.running;
+    if (on) {
+      fxActive[h] = true;
+      fxApply(ucell[h].state, ucell[h].bar, h, ms);
+      if (h == activeHost) fxApply(mui[h].lblState, mui[h].barProg, h, ms);
+    } else if (fxActive[h]) {
+      fxActive[h] = false;                 // 刚结束：立即恢复静态样式
+      fxSetPlain(v, ucell[h].state);
+      if (ucell[h].bar) lv_obj_set_style_bg_color(ucell[h].bar, C_OK, LV_PART_INDICATOR);
+      if (h == activeHost) {
+        fxSetPlain(v, mui[h].lblState);
+        if (mui[h].barProg) lv_obj_set_style_bg_color(mui[h].barProg, C_OK, LV_PART_INDICATOR);
+      }
+    }
+  }
 }
 
 static const char *cellTitle(int h) {
@@ -1437,8 +1544,10 @@ void refreshGridDash() {
     const HostView &v = dview[h];
     lv_color_t col;
     hostStateText(v, st, sizeof(st), col);
-    setLbl(c.state, st);
-    lv_obj_set_style_text_color(c.state, col, 0);
+    if (!fxActive[h]) {                    // 渲染中时状态字由特效层接管
+      setLbl(c.state, st);
+      lv_obj_set_style_text_color(c.state, col, 0);
+    }
     uint32_t secs = (v.serverOk && v.run.running && v.run.start_ms) ? (millis() - v.run.start_ms) / 1000 : 0;
     if (v.serverOk) snprintf(t, sizeof(t), "%02u:%02u", (unsigned)(secs / 60), (unsigned)(secs % 60));
     else strcpy(t, "--:--");
@@ -1460,7 +1569,7 @@ void refreshGridDash() {
     setLbl(c.step, t);
     if (pct < 0) pct = 0;
     if (pct > 100) pct = 100;
-    setBar(c.bar, (int)pct, C_OK, nullptr, "");
+    setBar(c.bar, (int)pct, fxActive[h] ? fxNeon(h, millis()) : C_OK, nullptr, "");
     if (c.vramVal) {
       if (v.vitals.ok && v.vitals.vram_total > 0) {
         double used = v.vitals.vram_total - v.vitals.vram_free;
@@ -1573,8 +1682,10 @@ void refreshUltraDash() {
     const Ultra &u = v.ultra;
     lv_color_t col;
     hostStateText(v, st, sizeof(st), col);
-    setLbl(c.state, st);
-    lv_obj_set_style_text_color(c.state, col, 0);
+    if (!fxActive[h]) {                    // 渲染中时状态字由特效层接管
+      setLbl(c.state, st);
+      lv_obj_set_style_text_color(c.state, col, 0);
+    }
     uint32_t secs = (v.serverOk && v.run.running && v.run.start_ms) ? (millis() - v.run.start_ms) / 1000 : 0;
     if (v.serverOk) snprintf(t, sizeof(t), "%02u:%02u", (unsigned)(secs / 60), (unsigned)(secs % 60));
     else strcpy(t, "--:--");
@@ -1597,7 +1708,7 @@ void refreshUltraDash() {
     } else strcpy(t, "");
     if (c.step) setLbl(c.step, t);
     if (pct < 0) pct = 0; if (pct > 100) pct = 100;
-    setBar(c.bar, (int)pct, C_OK, nullptr, "");
+    setBar(c.bar, (int)pct, fxActive[h] ? fxNeon(h, millis()) : C_OK, nullptr, "");
     if (c.queue) {
       if (v.serverOk) snprintf(t, sizeof(t), L("Q%d", "队%d"), v.run.pending);
       else strcpy(t, L("Q-", "队-"));
@@ -1715,6 +1826,7 @@ void refreshGridOut() {
 uint32_t lastDashBuild = 0;
 void buildDashboard() {
   if (nHosts == 0) return;
+  if (!fxTimer) fxTimer = lv_timer_create(fxTick, 66, nullptr);  // 渲染中特效，15fps
   lastDashBuild = millis();
   if (scrDash) {
     if (scrSetup && lv_scr_act() == scrDash) lv_scr_load(scrSetup);
@@ -1878,11 +1990,13 @@ void refreshMonitor() {
     s = linking ? L("CONNECTING", "连接中") : L("OFFLINE", "离线");
     c = linking ? C_WARN : C_ERR;
   }
-  else if (run.running) { s = L("GENERATING", "生成中"); c = C_OK; }
+  else if (run.running) { s = L("RENDERING", "渲染中"); c = C_ACCENT; }
   else if (run.pending > 0) { s = L("QUEUED", "排队中"); c = C_WARN; }
-  else { s = L("IDLE", "空闲"); c = C_ACCENT; }
-  setLbl(m.lblState, s);
-  lv_obj_set_style_text_color(m.lblState, c, 0);
+  else { s = L("IDLE", "空闲"); c = C_OK; }
+  if (!fxActive[activeHost]) {             // 渲染中时状态字由特效层接管
+    setLbl(m.lblState, s);
+    lv_obj_set_style_text_color(m.lblState, c, 0);
+  }
 
   uint32_t secs = (serverOk && run.running && run.start_ms) ? (millis() - run.start_ms) / 1000 : 0;
   if (serverOk) snprintf(t, sizeof(t), "%02u:%02u", (unsigned)(secs / 60), (unsigned)(secs % 60));
@@ -2426,7 +2540,10 @@ void fetchQueue(NetData &nd) {
   if (pend >= 0) nd.run.pending = pend;
   if (running >= 0) {
     if (running > 0 && !nd.run.running) { nd.run.running = true; nd.run.start_ms = millis(); }
-    if (running == 0 && nd.run.running && !nd.run.connected) { nd.run.running = false; nd.run.pv = nd.run.pmax = 0; nd.run.node[0] = 0; }
+    // /queue 是"有没有任务在跑"的权威来源。以前只在 WS 未连接时兜底清位，
+    // 但 execution_success 事件可能因 WS 掉线重连丢失——WS 连着就永远不清，
+    // 表现为"任务早完了，屏幕还在生成中+计时"。改为队列空即清，不论 WS。
+    if (running == 0 && nd.run.running) { nd.run.running = false; nd.run.pv = nd.run.pmax = 0; nd.run.node[0] = 0; }
   }
   const char *qr = findIn(s, len, "\"queue_running\"", 0);
   if (qr && running > 0) {
