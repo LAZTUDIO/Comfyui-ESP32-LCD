@@ -39,7 +39,7 @@ FROZEN = bool(getattr(sys, "frozen", False))
 # 配置文件必须落在 exe 旁边，否则每次重启都丢配置。
 APP_DIR = os.path.dirname(os.path.abspath(sys.executable)) if FROZEN else HERE
 RES_DIR = getattr(sys, "_MEIPASS", HERE)
-VERSION = "1.2.0"
+VERSION = "1.3.0"
 DEFAULT_PORT = 8189
 HISTORY_LEN = 300          # 5 分钟 @1s
 LOG_LINES = 400
@@ -545,7 +545,7 @@ class Gpu:
     def sample(self):
         out = {"util": None, "mem_util": None, "vram_used": None, "vram_total": self.vram_total,
                "power_w": None, "temp_c": None, "clock_mhz": None, "fan_pct": None,
-               "hotspot_c": None, "fan_rpm": None}
+               "hotspot_c": None, "fan_rpm": None, "power_covers_cpu": False}
         if self.vendor == "nvidia":
             self._sample_nvidia(out)
         elif self.vendor == "amd":
@@ -581,6 +581,48 @@ class Gpu:
         out["clock_mhz"] = num(6)
         out["fan_pct"] = clamp_pct(num(7))
 
+    def _read_linux_thermal(self, out):
+        """hwmon 里的温度与风扇。
+
+        按 label 取数，不按节点序号硬猜：amdgpu 的 temp1=edge、temp2=junction
+        （热点）。APU 上通常只有 edge 一路，热点与风扇缺失属平台限制，留 None。
+        """
+        import glob
+        temps = {}
+        for path in sorted(glob.glob(os.path.join(self.hwmon, "temp*_input"))):
+            raw = read_text(path)
+            if not raw:
+                continue
+            try:
+                val = round(int(raw) / 1000.0, 1)
+            except ValueError:
+                continue
+            key = path[:-len("_input")]
+            label = (read_text(key + "_label") or "").strip().lower()
+            temps[label or os.path.basename(key)] = val
+        edge = next((temps[k] for k in ("edge", "gpu edge") if k in temps), None)
+        hotspot = next((temps[k] for k in ("junction", "hotspot") if k in temps), None)
+        if edge is None and temps:
+            # 没有 label 的老内核：低温那路是 edge，高温那路是 junction
+            vals = sorted(temps.values())
+            edge = vals[0]
+            hotspot = vals[-1] if len(vals) > 1 else None
+        out["temp_c"] = edge
+        if hotspot is not None and (edge is None or hotspot > edge):
+            out["hotspot_c"] = hotspot
+        fan = read_text(os.path.join(self.hwmon, "fan1_input"))
+        if fan:
+            try:
+                out["fan_rpm"] = int(fan)
+            except ValueError:
+                pass
+        pwm = read_text(os.path.join(self.hwmon, "pwm1"))
+        if pwm:
+            try:
+                out["fan_pct"] = round(int(pwm) / 2.55, 1)
+            except ValueError:
+                pass
+
     def _sample_amd_linux(self, out):
         dev = self.drm
         if dev:
@@ -611,29 +653,21 @@ class Gpu:
                 if m:
                     out["clock_mhz"] = int(m.group(2))
         if self.hwmon:
-            for label in ("temp1_input", "temp2_input", "temp3_input"):
-                v = read_text(os.path.join(self.hwmon, label))
-                if v:
-                    try:
-                        out["temp_c"] = round(int(v) / 1000.0, 1)
-                        break
-                    except ValueError:
-                        pass
-            pwm = read_text(os.path.join(self.hwmon, "pwm1"))
-            if pwm:
-                try:
-                    out["fan_pct"] = round(int(pwm) / 2.55, 1)
-                except ValueError:
-                    pass
+            self._read_linux_thermal(out)
         if self.hwmon_power:
-            for label in ("power1_average", "power1_input"):
-                v = read_text(os.path.join(self.hwmon_power, label))
+            for name in ("power1_average", "power1_input"):
+                v = read_text(os.path.join(self.hwmon_power, name))
                 if v:
                     try:
                         out["power_w"] = round(int(v) / 1e6, 1)
                         break
                     except ValueError:
                         pass
+            # APU 的 PPT 是 SoC 整包功率（实测空载 14W、CPU 满载 157W），
+            # 已经包含 CPU，不能再与 CPU 功耗相加，否则重复计数。
+            label = (read_text(os.path.join(self.hwmon_power, "power1_label")) or "").strip().lower()
+            if out["power_w"] is not None and self.apu and label == "ppt":
+                out["power_covers_cpu"] = True
         if out["power_w"] is None and shutil.which("rocm-smi"):
             txt = run_cmd(["rocm-smi", "--showpower", "--csv"], timeout=6)
             for line in txt.splitlines()[1:]:
@@ -744,9 +778,15 @@ class Power:
         self.pdh = PdhEnergy() if IS_WIN else None
         if not IS_WIN:
             import glob
-            for p in sorted(glob.glob("/sys/class/powercap/intel-rapl:0")):
-                if os.path.exists(os.path.join(p, "energy_uj")):
+            # RAPL 封装功耗：不同内核/平台编号不同（intel-rapl:0、:1…），
+            # 只认 name=package-N 的那一级，别把 core 子域当封装。
+            for p in sorted(glob.glob("/sys/class/powercap/*")):
+                if not os.path.exists(os.path.join(p, "energy_uj")):
+                    continue
+                nm = (read_text(os.path.join(p, "name")) or "").lower()
+                if nm.startswith("package"):
                     self.rapl = p
+                    break
             for hw in glob.glob("/sys/class/hwmon/hwmon*"):
                 nm = read_text(os.path.join(hw, "name")) or ""
                 if nm in ("k10temp", "zenpower", "coretemp"):
@@ -1215,8 +1255,16 @@ class State:
         gpu_w = g.get("power_w")
         cpu_w = pw.get("cpu_w")
         total_w = None
-        if gpu_w is not None or cpu_w is not None:
+        if g.get("power_covers_cpu") and gpu_w is not None:
+            # APU：hwmon 的 PPT 已是 SoC 整包（CPU+GPU），CPU 侧再读会重复
+            total_w = gpu_w
+            note = "APU 整包（PPT，含 CPU+GPU）"
+        elif gpu_w is not None or cpu_w is not None:
             total_w = round((gpu_w or 0) + (cpu_w or 0), 1)
+            note = "GPU+CPU 实测合计" if (gpu_w is not None and cpu_w is not None) \
+                else ("仅 GPU（CPU 功耗不可读）" if gpu_w is not None else "仅 CPU（GPU 功耗不可读）")
+        else:
+            note = "不可读"
         hw = {
             "ts": now_ms(),
             "cpu_pct": round(cr["pct"], 1) if cr["pct"] is not None else None,
@@ -1236,9 +1284,7 @@ class State:
             "gpu_hotspot_c": g.get("hotspot_c"),
             "gpu_fan_rpm": g.get("fan_rpm"),
             "power_total_w": total_w,
-            "power_note": "GPU+CPU 实测合计" if (gpu_w is not None and cpu_w is not None)
-                          else ("仅 GPU（CPU 功耗不可读）" if gpu_w is not None
-                                else ("仅 CPU（GPU 功耗不可读）" if cpu_w is not None else "不可读")),
+            "power_note": note,
             "disk": dn["disk"], "net": dn["net"],
             "uptime_s": dn["uptime_s"], "load": dn["load"], "procs": dn["procs"],
         }

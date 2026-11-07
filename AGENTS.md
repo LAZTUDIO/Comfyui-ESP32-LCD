@@ -34,9 +34,11 @@ curl http://<host>:8189/api/panel
 
 ## 当前状态（2026-11-07）
 - Ultra 固件已烧录；1/2/3/4 台布局 + 离线降级 + 基础回归均已截图验证。
-- halo `192.168.31.95`：助手已 systemd 常驻（active），真机数值正确。
-- win `192.168.31.195`：助手文件已部署但**未启动**；等用户在桌面双击
-  `%USERPROFILE%\comfyui-assistant\start.bat`。
+- halo `192.168.31.95`：助手 **v1.3.0** systemd 常驻（active），SSH 用 `max@192.168.31.95`（本机
+  `~/.ssh/id_ed25519` 免密）；重启服务无 sudo NOPASSWD，用 `kill -9` 主进程触发
+  `Restart=on-failure` 自动拉起。APU 整包功耗走 amdgpu PPT（见 v1.3.0 提交）。
+- win `192.168.31.195`：**v1.3.0** 桌面 exe 常驻（托盘 + 窗口），GPU 功耗走 ADLX、
+  CPU 走 PDH Energy Meter。
 - 面板已恢复原配置（Ultra 关）。待用户在面板开 Ultra 做双机联调。
 
 ## 改代码时的注意
