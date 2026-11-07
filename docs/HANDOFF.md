@@ -437,6 +437,61 @@ curl http://127.0.0.1:8189/api/panel
 
 ---
 
+### 10.4 Windows 工具链实测记录（2026-11-07，可直接照抄）
+
+这台 win（192.168.31.195 / TX265K-7900XT）已经把固件编出来了，下面是**实际验证过**的配置，
+与 §10.2 的差别见条目末尾。
+
+**A. arduino-cli 本体**
+```
+C:\Users\265k\bin\arduino-cli.exe      # v1.5.1
+```
+- 直连 GitHub 只有 ~30KB/s，18MB 的 CLI 下不下来；走 `https://gh-proxy.com/https://github.com/...` 能到 7MB/s。
+- 不需要把它加进系统 PATH；`tools\build.bat` 调的是裸 `arduino-cli`，临时用
+  `PATH="/c/Users/265k/bin:$PATH"` 即可。
+
+**B. core 3.3.12 —— 关键：把索引里的 GitHub 地址改写成镜像**
+- 官方索引/平台包都挂在 github release，直连下 394MB 的 `esp-x32` 要 2 小时以上。
+- 实测 `https://dl.espressif.cn/github_assets/<owner>/<repo>/releases/download/...`
+  就是 GitHub release 的国内镜像，**27MB/s**。改写规则：
+  `https://github.com/X` → `https://dl.espressif.cn/github_assets/X`。
+- 做法：把 `%LOCALAPPDATA%\Arduino15\*.json` 里所有 esp32 包的 `platforms[].url` 与
+  `tools[].systems[].url` 批量改写（原始文件备份在 `C:\Users\265k\esp-libs\idx_backup\`），
+  然后 `arduino-cli core install esp32:esp32@3.3.12`，6 分钟装完（含 673MB 的 esp-rv32 等全芯片 libs）。
+- **注意**：`arduino-cli core update-index` 会把索引覆盖回官方版本，改写失效，需重新改写。
+  另：`arduino.me/packages/package_esp32_index_cn.json` 返回的是 SPA 的 HTML，不能当索引。
+
+**C. 7 个库装在哪**
+- 必须是 sketchbook 库目录：`%USERPROFILE%\Documents\Arduino\libraries\`
+  （`arduino-cli lib list` 只认这里；`Arduino15\libraries` 是内置库目录，不参与用户库解析）。
+- **目录联接/符号链接不行**：arduino-cli 是 Go 写的，遍历时跳过 reparse point，库会"看不见"。
+  要实体目录（或干脆用 `fetch_libs.py` 直接下到 sketchbook）。
+- 一键脚本：`python C:\Users\265k\esp-libs\fetch_libs.py`（走 gh-proxy，7 个库共约 40MB）。
+- `lv_conf.h` 放在 **`libraries\lv_conf.h`（lvgl 文件夹的上一级）**，不是放进 lvgl 里面；
+  lvgl 的 `lv_conf_internal.h` 默认 `#include "../../lv_conf.h"`。
+- Arduino_GFX 打完 `tools/patches/arduino_gfx_1.5.5_core3.patch` 后，编译期有
+  `TouchDrvFT6X36.hpp is deprecated` 的 `#pragma message` 警告（SensorLib 0.5.1 自身提示），无害。
+
+**D. 编译结果（与 Mac 记录一致）**
+```
+Sketch uses 1593323 bytes (50%) of program storage space. Maximum is 3145728 bytes.
+Global variables use 154044 bytes (47%) of dynamic memory, leaving 173636 bytes for local variables.
+```
+对应命令（与 `tools\build.bat` 的 FQBN 等价）：
+```bash
+arduino-cli compile --clean -b "esp32:esp32:esp32s3:USBMode=hwcdc,CDCOnBoot=cdc,FlashSize=16M,PSRAM=opi,PartitionScheme=app3M_fat9M_16MB" firmware/comfyui_panel
+```
+- `--clean` 全量编译约 15 分钟（LVGL 文件多），增量几秒；用 `--output-dir` 可把 bin 收到指定目录。
+
+**E. 已排除的错误路线（别再走）**
+- **PlatformIO + 本机 espressif32 6.10.0**：该平台锁 arduino-esp32 **2.0.17**，而固件用了
+  core 3.x 才有 `WebServer::client()` 返回 `WiFiClient&` 的写法（2.0.17 返回值类型，编译报
+  "cannot bind non-const lvalue reference"）；且 PIO 的 `.ino` 原型生成会漏掉 `static` 函数
+  （`mkBarIn` 报 not declared）。PIO 的 registry 在国内还会挂死。
+- 机器上原有的 `Arduino15` 只装了 2.0.17-cn；**2.0.17 编不了这份代码**，不是配置问题。
+
+---
+
 ## 11. 新 agent 接手后的第一轮检查
 
 1. 读本文件、`AGENTS.md`、`tests/2026-11-07-ultra-layouts/RECORD.md`。

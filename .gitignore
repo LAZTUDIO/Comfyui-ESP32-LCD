@@ -8,6 +8,9 @@ build/
 *.bin
 *.zip
 
+# PlatformIO（备用构建，见 platformio.ini）
+.pio/
+
 # Local assets (generated on demand)
 tools/fonts/*.otf
 tools/samples/
