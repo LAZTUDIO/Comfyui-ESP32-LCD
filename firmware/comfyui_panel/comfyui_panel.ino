@@ -251,9 +251,9 @@ struct MonUI {
   lv_obj_t *gBar[2] = {nullptr, nullptr}, *gVal[2] = {nullptr, nullptr};
   lv_obj_t *lblGpu = nullptr, *imgGpu = nullptr, *lblAcc = nullptr, *lblVer = nullptr;
   lv_obj_t *logLabel = nullptr;
-  lv_obj_t *uLbl[4] = {nullptr, nullptr, nullptr, nullptr};
-  lv_obj_t *uVal[4] = {nullptr, nullptr, nullptr, nullptr};
-  lv_obj_t *uBar[4] = {nullptr, nullptr, nullptr, nullptr};
+  lv_obj_t *uLbl[5] = {nullptr, nullptr, nullptr, nullptr, nullptr};
+  lv_obj_t *uVal[5] = {nullptr, nullptr, nullptr, nullptr, nullptr};
+  lv_obj_t *uBar[5] = {nullptr, nullptr, nullptr, nullptr, nullptr};
   lv_obj_t *uPower = nullptr;
 };
 struct OutUI {
@@ -299,9 +299,9 @@ struct UltraCell {
   lv_obj_t *title = nullptr, *state = nullptr, *dur = nullptr, *node = nullptr,
            *step = nullptr, *bar = nullptr, *gpu = nullptr, *img = nullptr,
            *power = nullptr, *queue = nullptr;
-  lv_obj_t *mLbl[4] = {nullptr, nullptr, nullptr, nullptr};
-  lv_obj_t *mVal[4] = {nullptr, nullptr, nullptr, nullptr};
-  lv_obj_t *mBar[4] = {nullptr, nullptr, nullptr, nullptr};
+  lv_obj_t *mLbl[5] = {nullptr, nullptr, nullptr, nullptr, nullptr};
+  lv_obj_t *mVal[5] = {nullptr, nullptr, nullptr, nullptr, nullptr};
+  lv_obj_t *mBar[5] = {nullptr, nullptr, nullptr, nullptr, nullptr};
   bool compact = false;
 };
 UltraCell ucell[MAX_HOSTS];
@@ -1100,24 +1100,25 @@ static void buildMonitor(int idx, lv_obj_t *tile) {
 
   lv_obj_t *gCard = mkCard(tile, 4, 84, 176, 198);
   if (ultraEnabled) {
-    static const char *MLBL[4] = {"CPU", "GPU", "RAM", "VRAM"};
-    for (int k = 0; k < 4; k++) {
-      int y = 2 + k * 30;
+    static const char *MLBL[5] = {"CPU", "GPU", "RAM", "VRAM", "TEMP"};
+    // 5 行 × 27px：CPU/GPU/RAM/VRAM 占用 + GPU 温度（bar 按 0-100°C 缩放）
+    for (int k = 0; k < 5; k++) {
+      int y = 2 + k * 27;
       m.uLbl[k] = mkLabel(gCard, MLBL[k], C_MUT, 4, y, 12);
       m.uVal[k] = mkLabel(gCard, "--", C_TXT, 0, y, 12);
       lv_obj_align(m.uVal[k], LV_ALIGN_TOP_RIGHT, -4, y);
       m.uBar[k] = mkBarIn(gCard, 4, y + 16, 164, 8, C_ACCENT);
     }
-    m.uPower = mkLabel(gCard, "", C_WARN, 4, 124, 12);
+    m.uPower = mkLabel(gCard, "", C_WARN, 4, 134, 12);
     lv_obj_set_width(m.uPower, 164);
     lv_label_set_long_mode(m.uPower, LV_LABEL_LONG_DOT);
-    mkLabel(gCard, "GPU", C_MUT, 4, 146, 12);
+    mkLabel(gCard, "GPU", C_MUT, 4, 156, 12);
     m.imgGpu = lv_img_create(gCard);
-    lv_obj_set_pos(m.imgGpu, 34, 145);
-    m.lblGpu = mkLabel(gCard, "--", C_TXT, 54, 146, 12);
+    lv_obj_set_pos(m.imgGpu, 34, 155);
+    m.lblGpu = mkLabel(gCard, "--", C_TXT, 54, 156, 12);
     lv_obj_set_width(m.lblGpu, 114);
     lv_label_set_long_mode(m.lblGpu, LV_LABEL_LONG_DOT);
-    m.lblVer = mkLabel(gCard, "ComfyUI --", C_MUT, 4, 166, 12);
+    m.lblVer = mkLabel(gCard, "ComfyUI --", C_MUT, 4, 176, 12);
     lv_obj_set_width(m.lblVer, 164);
     lv_label_set_long_mode(m.lblVer, LV_LABEL_LONG_DOT);
   } else {
@@ -1509,7 +1510,7 @@ static void buildUltraCell(int h, lv_obj_t *tile, int x, int y, int cw, int ch) 
   lv_obj_t *card = mkCard(tile, x, y, cw, ch);
   int iw = cw - 12, ih = ch - 12;
   c.compact = (ih < 200);
-  static const char *MLBL[4] = {"CPU", "GPU", "RAM", "VRAM"};
+  static const char *MLBL[5] = {"CPU", "GPU", "RAM", "VRAM", "TEMP"};
   int cy = 0;
   c.title = mkLabel(card, cellTitle(h), C_MUT, 0, cy, 12);
   lv_obj_set_width(c.title, iw - 44);
@@ -1539,7 +1540,8 @@ static void buildUltraCell(int h, lv_obj_t *tile, int x, int y, int cw, int ch) 
     lv_obj_set_width(c.gpu, iw - 20);
     lv_label_set_long_mode(c.gpu, LV_LABEL_LONG_DOT);
     cy += 18;
-    for (int k = 0; k < 4; k++) {
+    // 5 行指标：CPU/GPU/RAM/VRAM 占用 + GPU 温度（bar 按 0-100°C 缩放）
+    for (int k = 0; k < 5; k++) {
       c.mLbl[k] = mkLabel(card, MLBL[k], C_MUT, 0, cy, 12);
       c.mVal[k] = mkLabel(card, "--", C_TXT, 0, cy, 12);
       lv_obj_align(c.mVal[k], LV_ALIGN_TOP_RIGHT, 0, cy);
@@ -1615,10 +1617,20 @@ void refreshUltraDash() {
       lv_obj_set_style_text_color(c.mVal[k], unknown ? C_MUT : pctColor(p), 0);
       if (c.mBar[k]) setBar(c.mBar[k], unknown ? 0 : p, pctColor(p), nullptr, "");
     }
+    if (c.mVal[4]) {  // TEMP 行：GPU 温度，bar 按 0-100°C 缩放，颜色沿用 60/85 阈值
+      bool unknown = !u.ok || u.gpuTemp < 0;
+      if (unknown) strcpy(t, "--"); else snprintf(t, sizeof(t), "%.0f°C", u.gpuTemp);
+      setLbl(c.mVal[4], t);
+      lv_obj_set_style_text_color(c.mVal[4], unknown ? C_MUT : pctColor((int)u.gpuTemp), 0);
+      if (c.mBar[4]) setBar(c.mBar[4], unknown ? 0 : (int)u.gpuTemp,
+                            pctColor((int)u.gpuTemp), nullptr, "");
+    }
     if (c.power) {
-      if (!u.ok) snprintf(t, sizeof(t), "%s", u.everSeen ? L("power: assistant offline", "功耗：助手离线") : L("power: connecting", "功耗：连接中"));
-      else if (u.watts < 0) snprintf(t, sizeof(t), "%s", L("power --", "功耗 --"));
-      else snprintf(t, sizeof(t), L("power %.0f W", "功耗 %.0f W"), u.watts);
+      if (!u.ok) snprintf(t, sizeof(t), "%s", u.everSeen ? L("power: assistant offline", "包功耗：助手离线") : L("power: connecting", "包功耗：连接中"));
+      else if (u.watts < 0) snprintf(t, sizeof(t), "%s", L("power --", "包功耗 --"));
+      else if (c.compact && u.gpuTemp >= 0)
+        snprintf(t, sizeof(t), L("pkg %.0f W · GPU %.0f°C", "包功耗 %.0f W · GPU %.0f°C"), u.watts, u.gpuTemp);
+      else snprintf(t, sizeof(t), L("pkg %.0f W", "包功耗 %.0f W"), u.watts);
       setLbl(c.power, t);
       lv_obj_set_style_text_color(c.power, (u.ok && u.watts >= 0) ? C_WARN : C_MUT, 0);
     }
@@ -1947,10 +1959,17 @@ void refreshMonitor() {
       lv_obj_set_style_text_color(m.uVal[k], unknown ? C_MUT : pctColor(p), 0);
       setBar(m.uBar[k], unknown ? 0 : p, pctColor(p), nullptr, "");
     }
+    if (m.uVal[4]) {  // TEMP 行：GPU 温度，bar 按 0-100°C 缩放
+      bool unknown = !ultra.ok || ultra.gpuTemp < 0;
+      if (unknown) strcpy(t, "--"); else snprintf(t, sizeof(t), "%.0f°C", ultra.gpuTemp);
+      setLbl(m.uVal[4], t);
+      lv_obj_set_style_text_color(m.uVal[4], unknown ? C_MUT : pctColor((int)ultra.gpuTemp), 0);
+      setBar(m.uBar[4], unknown ? 0 : (int)ultra.gpuTemp, pctColor((int)ultra.gpuTemp), nullptr, "");
+    }
     if (m.uPower) {
-      if (!ultra.ok) snprintf(t, sizeof(t), "%s", ultra.everSeen ? L("power: assistant offline", "功耗：助手离线") : L("power: connecting", "功耗：连接中"));
-      else if (ultra.watts < 0) snprintf(t, sizeof(t), "%s", L("power --", "功耗 --"));
-      else snprintf(t, sizeof(t), L("power %.0f W", "功耗 %.0f W"), ultra.watts);
+      if (!ultra.ok) snprintf(t, sizeof(t), "%s", ultra.everSeen ? L("power: assistant offline", "包功耗：助手离线") : L("power: connecting", "包功耗：连接中"));
+      else if (ultra.watts < 0) snprintf(t, sizeof(t), "%s", L("power --", "包功耗 --"));
+      else snprintf(t, sizeof(t), L("pkg %.0f W", "包功耗 %.0f W"), ultra.watts);
       setLbl(m.uPower, t);
       lv_obj_set_style_text_color(m.uPower, (ultra.ok && ultra.watts >= 0) ? C_WARN : C_MUT, 0);
     }
@@ -2996,7 +3015,7 @@ void handleWifi() {
 void setup() {
   Serial.begin(115200);
   delay(800);
-  Serial.println("\n=== ComfyUI panel boot (v4) ===");
+  Serial.println("\n=== ComfyUI panel boot (v5) ===");
   Serial.printf("heap=%u psram=%u\n", ESP.getFreeHeap(), ESP.getPsramSize());
 
   netMux = xSemaphoreCreateMutex();
