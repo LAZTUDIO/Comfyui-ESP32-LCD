@@ -39,7 +39,7 @@ FROZEN = bool(getattr(sys, "frozen", False))
 # 配置文件必须落在 exe 旁边，否则每次重启都丢配置。
 APP_DIR = os.path.dirname(os.path.abspath(sys.executable)) if FROZEN else HERE
 RES_DIR = getattr(sys, "_MEIPASS", HERE)
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 DEFAULT_PORT = 8189
 HISTORY_LEN = 300          # 5 分钟 @1s
 LOG_LINES = 400
@@ -211,9 +211,179 @@ def read_text(path):
         return None
 
 
+class _PdhFmtValue(ctypes.Structure):
+    _fields_ = [("CStatus", ctypes.c_ulong), ("doubleValue", ctypes.c_double)]
+
+
+class _PdhFmtItem(ctypes.Structure):
+    _fields_ = [("szName", ctypes.c_wchar_p), ("FmtValue", _PdhFmtValue)]
+
+
+class PdhEnergy:
+    """Windows：用 PDH 直接读 '\\Energy Meter(*)\\power'（RAPL，单位 mW）。
+
+    不 spawn PowerShell，采样约 1 ms。自动挑封装那一路（RAPL_Package0_PKG），
+    找不到就退回任何名字里带 PKG/PACKAGE 的实例。
+    注意：这是 Windows 自带的能量计量（Intel 平台普遍可用），AMD 桌面平台
+    多数不暴露，此时 ok=False，CPU 功耗仍显示 --。
+    """
+
+    FMT_DOUBLE = 0x00000200
+    MORE_DATA = 0x800007D2
+
+    def __init__(self):
+        self.ok = False
+        self.pdh = None
+        self.q = None
+        self.c = None
+        if not IS_WIN:
+            return
+        try:
+            pdh = ctypes.WinDLL("pdh")
+            pdh.PdhOpenQueryW.argtypes = [ctypes.c_wchar_p, ctypes.c_void_p,
+                                          ctypes.POINTER(ctypes.c_void_p)]
+            pdh.PdhAddCounterW.argtypes = [ctypes.c_void_p, ctypes.c_wchar_p,
+                                           ctypes.c_void_p,
+                                           ctypes.POINTER(ctypes.c_void_p)]
+            pdh.PdhCollectQueryData.argtypes = [ctypes.c_void_p]
+            pdh.PdhGetFormattedCounterArrayW.argtypes = [
+                ctypes.c_void_p, ctypes.c_ulong,
+                ctypes.POINTER(ctypes.c_ulong), ctypes.POINTER(ctypes.c_ulong),
+                ctypes.c_void_p]
+            pdh.PdhGetFormattedCounterArrayW.restype = ctypes.c_ulong
+            q = ctypes.c_void_p()
+            if pdh.PdhOpenQueryW(None, None, ctypes.byref(q)) != 0:
+                return
+            c = ctypes.c_void_p()
+            if pdh.PdhAddCounterW(q, r"\Energy Meter(*)\power", None,
+                                  ctypes.byref(c)) != 0:
+                return
+            pdh.PdhCollectQueryData(q)
+            self.pdh, self.q, self.c = pdh, q, c
+            self.ok = True
+        except Exception:
+            self.ok = False
+
+    def sample_w(self):
+        if not self.ok:
+            return None
+        try:
+            if self.pdh.PdhCollectQueryData(self.q) != 0:
+                return None
+            size = ctypes.c_ulong(0)
+            cnt = ctypes.c_ulong(0)
+            rc = self.pdh.PdhGetFormattedCounterArrayW(
+                self.c, self.FMT_DOUBLE, ctypes.byref(size), ctypes.byref(cnt), None)
+            if rc != self.MORE_DATA or size.value == 0:
+                return None
+            buf = ctypes.create_string_buffer(size.value)
+            rc = self.pdh.PdhGetFormattedCounterArrayW(
+                self.c, self.FMT_DOUBLE, ctypes.byref(size), ctypes.byref(cnt), buf)
+            if rc != 0:
+                return None
+            items = ctypes.cast(buf, ctypes.POINTER(_PdhFmtItem))
+            fallback = None
+            for i in range(cnt.value):
+                it = items[i]
+                if it.FmtValue.CStatus != 0 or not it.FmtValue.doubleValue:
+                    continue
+                nm = (it.szName or "").upper()
+                if nm.endswith("_PKG"):
+                    return round(it.FmtValue.doubleValue / 1000.0, 1)
+                if "PKG" in nm or "PACKAGE" in nm:
+                    fallback = it.FmtValue.doubleValue
+            return round(fallback / 1000.0, 1) if fallback else None
+        except Exception:
+            return None
+
+
+class AdlxGpu:
+    """Windows / AMD：官方 ADLX SDK（pip 包 `amd-adlx`）读整板功耗、温度、频率、占用。
+
+    为什么必须走 ADLX：ADL 的 Overdrive5/6 传感器在 RDNA3 + 新驱动上已停供
+    （实测 ADL2_Overdrive6_CurrentPower_Get 返回 rc=0 但值恒 0，
+      Temperature 返回 -8/-9）。HWiNFO / GPU-Z 在 A 卡上取传感器走的也是 ADLX。
+    另外：GPUPower（芯片功耗）多数卡不支持，GPUTotalBoardPower（整板）才是可用的那个。
+    """
+
+    def __init__(self):
+        self.ok = False
+        self.helper = None
+        self.sys = None
+        self.perf = None
+        self.gpu = None
+        self.note = ""
+
+    def open(self):
+        try:
+            from adlx import ADLX
+        except Exception as e:
+            self.note = "未安装 amd-adlx（%s）" % type(e).__name__
+            return False
+        try:
+            h = ADLX.ADLXHelper()
+            if h.Initialize() != ADLX.ADLX_RESULT.ADLX_OK:
+                self.note = "ADLX 初始化失败"
+                return False
+            s = h.GetSystemServices()
+            p = s.GetPerformanceMonitoringServices() if s is not None else None
+            gpus = (s.GetGPUs() or []) if s is not None else []
+            if p is None or not gpus:
+                self.note = "ADLX 无 GPU/性能服务"
+                return False
+            self.helper, self.sys, self.perf, self.gpu = h, s, p, gpus[0]
+            self.ok = True
+            return True
+        except Exception as e:
+            self.note = "ADLX 异常：%r" % e
+            self.ok = False
+            return False
+
+    def sample(self):
+        out = {}
+        if not self.ok:
+            return out
+        try:
+            m = self.perf.GetCurrentGPUMetrics(self.gpu)
+        except Exception:
+            return out
+
+        def g(name):
+            try:
+                f = getattr(m, name, None)
+                return f() if f is not None else None
+            except Exception:
+                return None
+
+        v = g("GPUUsage")
+        if v is not None:
+            out["util"] = clamp_pct(v)
+        v = g("GPUTemperature")
+        if v is not None:
+            out["temp_c"] = round(float(v), 1)
+        v = g("GPUHotspotTemperature")
+        if v is not None:
+            out["hotspot_c"] = round(float(v), 1)
+        v = g("GPUClockSpeed")
+        if v:
+            out["clock_mhz"] = int(v)
+        v = g("GPUFanSpeed")
+        if v:
+            out["fan_rpm"] = int(v)
+        v = g("GPUTotalBoardPower")
+        if v is None:
+            v = g("GPUPower")
+        if v is not None:
+            out["power_w"] = round(float(v), 1)
+        v = g("GPUVRAM")
+        if v:
+            out["vram_used_mb"] = int(v)
+        return out
+
+
 class Gpu:
     """NVIDIA: nvidia-smi; AMD Linux: sysfs + hwmon (+rocm-smi 兜底);
-    AMD Windows: amdsmi (若可用) + PowerShell 兜底。"""
+    AMD Windows: ADLX（首选，给整板功耗）+ PowerShell 兜底。"""
 
     def __init__(self):
         self.vendor = None        # nvidia / amd
@@ -227,6 +397,7 @@ class Gpu:
         self.hwmon_power = None
         self.amdsmi = None
         self.amdsmi_dev = None
+        self.adlx = None
         self.ps_cache = {}
         self._detect()
 
@@ -339,6 +510,7 @@ class Gpu:
                     self.vram_total = mi.get("total")
                 except Exception:
                     pass
+                self._attach_win_sensors()
                 return
         except Exception:
             pass
@@ -348,7 +520,17 @@ class Gpu:
             line = line.strip()
             if line and ("AMD" in line or "Radeon" in line):
                 self.vendor, self.name = "amd", line
-                return
+                break
+        if self.vendor == "amd":
+            self._attach_win_sensors()
+
+    def _attach_win_sensors(self):
+        """Windows / A 卡：挂 ADLX。拿不到就静默降级到 PowerShell 兜底。"""
+        if self.vendor != "amd":
+            return
+        a = AdlxGpu()
+        if a.open():
+            self.adlx = a
 
     def _powershell(self, cmd, key, ttl=4.0):
         now = time.time()
@@ -362,7 +544,8 @@ class Gpu:
     # ---------- sampling ----------
     def sample(self):
         out = {"util": None, "mem_util": None, "vram_used": None, "vram_total": self.vram_total,
-               "power_w": None, "temp_c": None, "clock_mhz": None, "fan_pct": None}
+               "power_w": None, "temp_c": None, "clock_mhz": None, "fan_pct": None,
+               "hotspot_c": None, "fan_rpm": None}
         if self.vendor == "nvidia":
             self._sample_nvidia(out)
         elif self.vendor == "amd":
@@ -467,6 +650,24 @@ class Gpu:
                     break
 
     def _sample_amd_win(self, out):
+        # 首选 ADLX：整板功耗 / 温度 / 频率 / 占用 / 显存，都是驱动直接给的
+        if self.adlx is not None:
+            d = self.adlx.sample()
+            if d:
+                if d.get("util") is not None:
+                    out["util"] = d["util"]
+                if d.get("temp_c") is not None:
+                    out["temp_c"] = d["temp_c"]
+                if d.get("hotspot_c") is not None:
+                    out["hotspot_c"] = d["hotspot_c"]
+                if d.get("clock_mhz"):
+                    out["clock_mhz"] = d["clock_mhz"]
+                if d.get("fan_rpm"):
+                    out["fan_rpm"] = d["fan_rpm"]
+                if d.get("power_w") is not None:
+                    out["power_w"] = d["power_w"]
+                if d.get("vram_used_mb"):
+                    out["vram_used"] = d["vram_used_mb"] * 1024 * 1024
         if self.amdsmi:
             a, d = self.amdsmi, self.amdsmi_dev
             try:
@@ -533,12 +734,14 @@ class Gpu:
 
 # ============================ power / temps ============================
 class Power:
-    """CPU 封装功耗：Intel RAPL energy 差分；AMD k10temp/zenpower hwmon。"""
+    """CPU 封装功耗：Windows 用 PDH 读 Energy Meter(RAPL)；
+    Linux 走 RAPL energy 差分 / hwmon(k10temp, zenpower)。"""
 
     def __init__(self):
         self.rapl = None
         self.prev = None
         self.hwmon = None
+        self.pdh = PdhEnergy() if IS_WIN else None
         if not IS_WIN:
             import glob
             for p in sorted(glob.glob("/sys/class/powercap/intel-rapl:0")):
@@ -568,6 +771,11 @@ class Power:
                 self.prev = (e, now)
             except (ValueError, TypeError):
                 pass
+        if out["cpu_w"] is None and self.pdh is not None:
+            w = self.pdh.sample_w()
+            if w is not None:
+                out["cpu_w"] = w
+                out["source"] = "rapl-pdh"
         if self.hwmon:
             if out["cpu_w"] is None:
                 for label in ("power1_input", "power1_average"):
@@ -1025,6 +1233,8 @@ class State:
             "gpu_temp_c": g["temp_c"],
             "gpu_clock_mhz": g["clock_mhz"],
             "gpu_fan_pct": g["fan_pct"],
+            "gpu_hotspot_c": g.get("hotspot_c"),
+            "gpu_fan_rpm": g.get("fan_rpm"),
             "power_total_w": total_w,
             "power_note": "GPU+CPU 实测合计" if (gpu_w is not None and cpu_w is not None)
                           else ("仅 GPU（CPU 功耗不可读）" if gpu_w is not None
@@ -1076,7 +1286,8 @@ class State:
             "gpu": dict(self.gpu.info(), util=hw.get("gpu_util"), mem_util=hw.get("gpu_mem_util"),
                         vram_used=hw.get("gpu_vram_used"), vram_total=hw.get("gpu_vram_total"),
                         vram_pct=vram_pct, power_w=hw.get("gpu_power_w"), temp_c=hw.get("gpu_temp_c"),
-                        clock_mhz=hw.get("gpu_clock_mhz"), fan_pct=hw.get("gpu_fan_pct")),
+                        clock_mhz=hw.get("gpu_clock_mhz"), fan_pct=hw.get("gpu_fan_pct"),
+                        hotspot_c=hw.get("gpu_hotspot_c"), fan_rpm=hw.get("gpu_fan_rpm")),
             "power": {"total_w": hw.get("power_total_w"), "gpu_w": hw.get("gpu_power_w"),
                       "cpu_w": hw.get("cpu_power_w"), "note": hw.get("power_note")},
             "disk": hw.get("disk", {}), "net": hw.get("net", {}),

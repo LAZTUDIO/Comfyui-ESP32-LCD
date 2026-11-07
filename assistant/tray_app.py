@@ -333,6 +333,11 @@ class App:
                 self.root.destroy()
             except Exception:
                 pass
+        # ADLX（amd-adlx）的 pybind 对象在解释器退场时释放会触发访问冲突
+        # （实测 exit=0xC0000005）。服务已停、日志已落盘，直接跳过清理退出。
+        log("进程结束")
+        sys.stdout.flush() if sys.stdout else None
+        os._exit(0)
 
     # ---- 托盘
     def build_tray(self):
@@ -429,7 +434,8 @@ def real_main():
 
     log("启动 v%s，监听 %s:%d，ComfyUI=%s" % (A.VERSION, args.bind, port, cfg.get("comfy_url")))
     app.run()
-    return 0
+    log("主循环结束")
+    os._exit(0)          # 同上：绕开 ADLX 退场崩溃
 
 
 if __name__ == "__main__":

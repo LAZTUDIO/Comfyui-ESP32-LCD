@@ -332,6 +332,45 @@ python3 assistant.py --port 8189          # 或 ./start.sh / start.bat
 - **`.bat` 必须纯 ASCII**：UTF-8 中文注释会被 cmd 按 GBK 解析，导致 `rem` 行残片被当命令执行。
 - 依赖：`pystray` + `Pillow`（构建机需 `pip install pystray`；`python -m PyInstaller` 需 6.x）。
 
+### 6.9 功耗/温度到底从哪来（2026-11-07 实测结论）
+
+面板上那一个「功耗 N W」= GPU + CPU 之和。三条链路各不相同：
+
+| 指标 | 平台 | 数据源 | 单位/换算 |
+|---|---|---|---|
+| GPU 整板功耗 | Windows / AMD | **ADLX**（官方 pip 包 `amd-adlx`）`IADLXGPUMetrics.GPUTotalBoardPower()` | 直接是 W |
+| GPU 功耗 | Linux / AMD | hwmon `power1_average`，rocm-smi 兜底 | µW → W |
+| GPU 功耗 | 任意 / NVIDIA | `nvidia-smi --query-gpu=power.draw` | W |
+| CPU 封装功耗 | Windows | **PDH** 计数器 `\Energy Meter(*)\power`（RAPL），取 `*_PKG` 那一路 | **mW → W** |
+| CPU 封装功耗 | Linux | RAPL `energy_uj` 差分 / k10temp·zenpower hwmon | µJ 差分 |
+
+**为什么必须用 ADLX，而不是 ADL**（这条最容易踩）：
+- ADL 的 Overdrive 传感器在 RDNA3 + 新 Adrenalin 上已经停供。实测（atiadlxx.dll）：
+  - `ADL2_Overdrive6_CurrentPower_Get` → `rc=0` 但值**恒为 0**（成功的假数据，最坑）
+  - `ADL2_Overdrive6_Temperature_Get` → `rc=-8/-9`（NOT_SUPPORTED）
+  - `ADL2_Overdrive6_PowerControl_Get` / `OverdriveN_PowerLimit_Get` → `rc=-8`
+  - `ADL2_Adapter_AdapterInfo_Get` → `rc=-3`
+- `amdsmi` 在 Windows 上**不可用**：PyPI 包是纯 Python 壳，要 `libamd_smi.so`，Linux 专用。
+- ADLX 里 `GPUPower()`（芯片功耗）在 RX 7900 XT 上 `IsSupportedGPUPower()=False`，
+  所以代码里取的是 `GPUTotalBoardPower()`（`IsSupportedGPUTotalBoardPower()=True`），
+  356 W / 344 W 这类数值与 HWiNFO 的 Total Board Power 对得上。
+
+**CPU 功耗不需要驱动**：Windows 自带 Energy Meter（就是 RAPL 的 OS 侧封装），
+实例形如 `RAPL_Package0_PKG / _PP0 / _PP1 / _DRAM`，用 PDH 通配符读数组再挑 `*_PKG`，
+单次采样约 1 ms，**不用 spawn PowerShell**。空载 50 W、ComfyUI 跑图时 ~80 W 量级。
+
+**HWiNFO / HWMonitor 是靠什么**：CPU 用自带内核驱动读 MSR（Intel 0x606/0x611、AMD SMN），
+GPU 走 ADLX。前者需要装驱动（WinRing0 一类已被 Defender 重点关照），我们不走这条路；
+后者我们直接调 ADLX，效果等价。
+
+**已知限制**
+- AMD 桌面平台 Windows 上一般没有 Energy Meter，此时 CPU 功耗仍是 `--`（GPU 功耗不影响）。
+- `amd-adlx` 要求 Python ≥ 3.13；打包时 `--collect-all adlx` 会把它塞进 exe。
+- ADLX 的 pybind 对象在解释器退场时释放会触发访问冲突（实测 `exit=0xC0000005`），
+  所以托盘版退出走 `os._exit(0)` 跳过清理，避免弹崩溃对话框。
+- 顺带可拿到的：热点温度 `GPUTemperature/GPUHotspotTemperature`、核心频率 `GPUClockSpeed`、
+  风扇转速 `GPUFanSpeed`（RPM）、显存占用 `GPUVRAM`（MB，注意是**用量**不是总量）。
+
 ---
 
 ## 7. 联调与测试方法
