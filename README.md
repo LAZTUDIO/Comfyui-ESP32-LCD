@@ -73,7 +73,7 @@ tools/
   theme_mockups.py        主题对照图生成
   patches/arduino_gfx_1.5.5_core3.patch
 tests/                    上机测试（mock 数据源、探针、截图、记录）
-docs/                     截图、主题对照图、开发接力手册（HANDOFF.md）
+docs/                     截图、主题对照图、接口文档（ASSISTANT_API.md）、开发接力手册（HANDOFF.md）
 ```
 
 ## 硬件
@@ -152,7 +152,17 @@ curl http://127.0.0.1:8189/api/panel            # 自检
 
 - 面板：`设置 → 服务器` 页打开 `Ultra`、端口 A 填 `8189`；总览页立即按主机数重排。
 - 助手 WebUI：`http://<host>:8189/`，可查看完整硬件/日志并启停 ComfyUI（与本机手动启动一致）。
-- Linux 建议用 systemd 常驻；**Windows 必须在桌面会话运行**，SSH/服务会话启动 ComfyUI 会导致 GPU 性能下降。
+- 远程启停/状态接口（供调度站、Agent、自动化脚本调用，无需 SSH）：
+
+  ```bash
+  curl -X POST http://<host>:8189/api/comfy/start            # 启动（异步，轮询 /api/panel 的 comfy.up 判就绪）
+  curl -X POST http://<host>:8189/api/comfy/stop             # 停止（队列有任务时被拒，须 {"force":true}）
+  curl http://<host>:8189/api/panel                          # 轻量状态（硬件 + 队列，1~2s 轮询）
+  curl http://<host>:8189/api/status                         # 全量状态（含 state 机、PID、版本）
+  ```
+
+  接口全量文档（9 个接口、状态机、force 语义、Linux/Windows 字段差异、告警阈值建议）：[docs/ASSISTANT_API.md](docs/ASSISTANT_API.md)。
+- Linux 建议用 systemd 常驻；**Windows 必须在桌面会话运行**，SSH/服务会话启动 ComfyUI 会导致 GPU 性能下降（助手 `session_warning` 字段可检测此状态）。
 - 字段契约、平台采集差异、部署与排障见 [docs/HANDOFF.md](docs/HANDOFF.md)。
 
 ## 调试接口
