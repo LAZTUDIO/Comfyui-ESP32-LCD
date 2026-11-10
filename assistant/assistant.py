@@ -1576,6 +1576,17 @@ class Handler(BaseHTTPRequestHandler):
             if "comfy_url" in changed and not re.match(r"^https?://[\w.\-]+(:\d+)?/?$", changed["comfy_url"]):
                 self._json({"ok": False, "msg": "comfy_url 格式不合法"}, 400)
                 return
+            # Windows 路径容错：不同 shell 的转义差异（cmd 不折叠 \\\\、PowerShell 变体）
+            # 会存进连续多道反斜杠。收敛为单道（UNC 开头 \\\\ 保留），避免 JSON 转义显示混淆。
+            if IS_WIN:
+                for k in ("workdir", "start_cmd"):
+                    if k in changed:
+                        v = changed[k]
+                        if v.startswith("\\\\"):
+                            v = v[:2] + re.sub(r"\\{2,}", "\\\\", v[2:])
+                        else:
+                            v = re.sub(r"\\{2,}", "\\\\", v)
+                        changed[k] = v
             st.cfg.update(changed)
             save_cfg(st.cfg)
             st.disknet.workdir = st.cfg.get("workdir") or HERE
