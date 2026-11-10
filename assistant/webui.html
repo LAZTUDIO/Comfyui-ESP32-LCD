@@ -381,14 +381,14 @@ async function loadCfg(){
     $('cfgUrl').value=c.comfy_url||'';$('cfgDir').value=c.workdir||'';$('cfgCmd').value=c.start_cmd||'';
   }catch(e){}
 }
-async function act(path,msgEl){
+async function act(path,msgEl,body){
   msgEl.textContent='发起中…';
-  try{const r=await fetch(path,{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});
+  try{const r=await fetch(path,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body||{})});
     const j=await r.json();msgEl.textContent=j.msg||'';poll();
   }catch(e){msgEl.textContent='请求失败：助手不可达';}
 }
 $('btnStart').onclick=()=>act('/api/comfy/start',$('comfyMsg'));
-$('btnStop').onclick=()=>{if(confirm('确定停止 ComfyUI？正在生成的任务会被中断。'))act('/api/comfy/stop',$('comfyMsg'));};
+$('btnStop').onclick=()=>{if(confirm('确定停止 ComfyUI？正在生成的任务会被中断。'))act('/api/comfy/stop',$('comfyMsg'),{force:true});};
 $('btnSave').onclick=async()=>{
   const body={comfy_url:$('cfgUrl').value.trim(),workdir:$('cfgDir').value.trim(),start_cmd:$('cfgCmd').value.trim()};
   try{const r=await fetch('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});

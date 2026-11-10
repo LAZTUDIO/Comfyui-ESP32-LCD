@@ -39,7 +39,7 @@ FROZEN = bool(getattr(sys, "frozen", False))
 # 配置文件必须落在 exe 旁边，否则每次重启都丢配置。
 APP_DIR = os.path.dirname(os.path.abspath(sys.executable)) if FROZEN else HERE
 RES_DIR = getattr(sys, "_MEIPASS", HERE)
-VERSION = "1.3.0"
+VERSION = "1.3.1"
 DEFAULT_PORT = 8189
 HISTORY_LEN = 300          # 5 分钟 @1s
 LOG_LINES = 400
@@ -935,8 +935,26 @@ class DiskNet:
 
 
 # ============================ ComfyUI ============================
-def pid_listening_on_port(port):
-    """找到监听指定端口的进程 pid（不依赖 psutil）。"""
+def _ps_listening_pids(port):
+    """netstat 归属不可靠时（实测这台机 LISTEN 行全是 PID 0）用
+    Get-NetTCPConnection 兜底。"""
+    cmd = ("$c = Get-NetTCPConnection -LocalPort %d -State Listen -ErrorAction SilentlyContinue | "
+           "Where-Object {$_.OwningProcess -gt 0} | "
+           "Select-Object -ExpandProperty OwningProcess -Unique; $c" % port)
+    txt = run_cmd(["powershell", "-NoProfile", "-Command", cmd], timeout=12)
+    out = []
+    for line in txt.splitlines():
+        line = line.strip()
+        if line.isdigit():
+            pid = int(line)
+            if pid:
+                out.append(pid)
+    return out
+
+
+def pids_listening_on_port(port):
+    """监听指定端口的进程 pid 列表（跳过 PID 0 的伪行，不依赖 psutil）。"""
+    out = []
     if IS_WIN:
         txt = run_cmd(["netstat", "-ano", "-p", "TCP"], timeout=6)
         for line in txt.splitlines():
@@ -944,10 +962,14 @@ def pid_listening_on_port(port):
             if len(p) >= 5 and p[0] == "TCP" and p[3] == "LISTENING":
                 if p[1].rsplit(":", 1)[-1] == str(port):
                     try:
-                        return int(p[4])
+                        pid = int(p[4])
                     except ValueError:
-                        pass
-        return None
+                        continue
+                    if pid:
+                        out.append(pid)
+        if not out:
+            out = _ps_listening_pids(port)   # netstat 归属丢失时兜底
+        return out
     inodes = set()
     for path in ("/proc/net/tcp", "/proc/net/tcp6"):
         try:
@@ -960,24 +982,56 @@ def pid_listening_on_port(port):
         except OSError:
             pass
     if not inodes:
-        return None
+        return out
     targets = {"socket:[%s]" % i for i in inodes}
     try:
         pids = [p for p in os.listdir("/proc") if p.isdigit()]
     except OSError:
-        return None
+        return out
     for pid in pids:
         fd_dir = "/proc/%s/fd" % pid
         try:
             for fd in os.listdir(fd_dir):
                 try:
                     if os.readlink(os.path.join(fd_dir, fd)) in targets:
-                        return int(pid)
+                        out.append(int(pid))
+                        break
                 except OSError:
                     continue
         except OSError:
             continue
-    return None
+    return out
+
+
+def _win_python_cmdlines():
+    """枚举 python 进程的 (pid, cmdline)。部分机器上套接字归属会全部落在
+    PID 0（实测本机如此），按命令行认 ComfyUI 反而可靠。"""
+    if not IS_WIN:
+        return []
+    cmd = ("Get-CimInstance Win32_Process -Filter \"Name like '%python%'\" | "
+           "ForEach-Object { \"$($_.ProcessId)|$($_.CommandLine)\" }")
+    txt = run_cmd(["powershell", "-NoProfile", "-Command", cmd], timeout=12)
+    out = []
+    for line in txt.splitlines():
+        line = line.strip()
+        if "|" not in line:
+            continue
+        pid_s, _, cl = line.partition("|")
+        if pid_s.isdigit() and int(pid_s):
+            out.append((int(pid_s), cl or ""))
+    return out
+
+
+def is_comfy_cmdline(cl):
+    # 只认 main.py：宽匹配 "comfy" 会误伤路径里带 comfyui 的无关进程
+    # （编辑器、脚本、本助手自己的测试进程），杀错就是事故。
+    return "main.py" in (cl or "").lower()
+
+
+def pid_listening_on_port(port):
+    """监听指定端口的第一个进程 pid（不含 PID 0）。"""
+    hits = pids_listening_on_port(port)
+    return hits[0] if hits else None
 
 
 def pid_cmdline(pid):
@@ -1038,6 +1092,7 @@ class ComfyUI:
             pass
         ok = stats is not None
         running = pending = 0
+        queue_ok = queue is not None
         if queue:
             running = len(queue.get("queue_running") or [])
             pending = len(queue.get("queue_pending") or [])
@@ -1046,23 +1101,24 @@ class ComfyUI:
                 self.last_ok = now_ms()
                 self.stats = stats
             self.queue = queue
+            if queue_ok:
+                # 队列取不到时不清零（模型加载期 ComfyUI 的 HTTP 会长时间无响应，
+                # 清零会让 stop 保护误判"没有任务"），保留最后已知计数。
+                self.last_queue_ok = now_ms()
+                self.running_n, self.pending_n = running, pending
             if running > 0 and not self.prev_running:
                 self.job_start_ms = now_ms()
-            if running == 0:
+            if queue_ok and running == 0:
                 self.job_start_ms = None
-            self.prev_running = running > 0
-            self.running_n, self.pending_n = running, pending
+            self.prev_running = queue_ok and running > 0
             if not ok and now_ms() - self.last_ext_check > 10000:
                 self.last_ext_check = now_ms()
-                pid = pid_listening_on_port(self.port)
-                if pid and pid != os.getpid():
-                    cmd = pid_cmdline(pid)
-                    if "comfy" in cmd.lower() or "main.py" in cmd.lower():
-                        self.ext_pid, self.ext_cmd = pid, cmd
-                    else:
-                        self.ext_pid = None
-                else:
-                    self.ext_pid = None
+                ext_pid, ext_cmd = None, ""
+                for pid, cl in _win_python_cmdlines():
+                    if pid != os.getpid() and is_comfy_cmdline(cl):
+                        ext_pid, ext_cmd = pid, cl
+                        break
+                self.ext_pid, self.ext_cmd = ext_pid, ext_cmd
             elif ok:
                 self.ext_pid = None
         return ok
@@ -1083,9 +1139,17 @@ class ComfyUI:
             devices = stats.get("devices") or []
             dev = devices[0] if devices else {}
             managed = self.proc is not None and self.proc.poll() is None
-            state = "running" if self.api_up() else ("starting" if managed else "stopped")
-            if not self.api_up() and self.ext_pid:
+            up = self.api_up()
+            if up:
+                # 外部启动的 ComfyUI 正常运行时不再叫 running（那是助手管的），
+                # 但对启停接口是透明的：state=external 一样能停。
+                state = "running" if managed else "external"
+            elif managed:
+                state = "starting"
+            elif self.ext_pid:
                 state = "external"
+            else:
+                state = "stopped"
             pid = self.proc.pid if managed else self.ext_pid
             snap = {
                 "state": state,
@@ -1118,8 +1182,12 @@ class ComfyUI:
         with self.lock:
             if self.proc is not None and self.proc.poll() is None:
                 return False, "ComfyUI 已由助手运行中"
-        if self.api_up():
+        # 现场探测：刚 stop 完 api_up() 还有 ≤8s 的旧真值，会误判"已有实例"
+        try:
+            http_json(self.url + "/system_stats", timeout=1.5)
             return False, "端口上已有 ComfyUI 在运行（外部启动），请先停止或改用接管"
+        except Exception:
+            pass
         cmd = self.cfg.get("start_cmd", "").strip()
         workdir = self.cfg.get("workdir", "").strip() or None
         if not cmd:
@@ -1162,8 +1230,17 @@ class ComfyUI:
             if self.proc is p:
                 self.proc = None
 
-    def stop(self):
+    def stop(self, force=False):
         timeout = float(self.cfg.get("stop_timeout", 15))
+        # 保护：最近 15s 内确认过队列有任务就拒绝直接杀（远程 Agent 误触会把
+        # 任务连人带任务端掉）。模型加载期 ComfyUI 的 HTTP 无响应，所以不用
+        # 现场 probe，用后台采样缓存的最后已知队列计数。
+        if not force:
+            with self.lock:
+                rn, pn = getattr(self, "running_n", 0), getattr(self, "pending_n", 0)
+                seen = getattr(self, "last_queue_ok", 0)
+            if seen and now_ms() - seen < 15000 and (rn or pn):
+                return False, "队列中还有任务（running=%d pending=%d），确认中断请带 force=true" % (rn, pn)
         with self.lock:
             p = self.proc
             ext = self.ext_pid
@@ -1176,11 +1253,27 @@ class ComfyUI:
                 pass
             with self.lock:
                 self.proc = None
+                self.last_ok = 0          # 清掉旧真值，state 立即回落 stopped
             return True, "已停止"
         if ext:
             self.log("停止外部 ComfyUI (pid=%d)…" % ext)
             ok = self._kill_pid(ext, timeout)
+            if ok:
+                with self.lock:
+                    self.last_ok = 0
             return ok, "已请求停止外部进程" if ok else "停止失败（权限不足？）"
+        # 外部 ComfyUI 正常运行中（API 活着）：这台机的套接字归属是坏的
+        # （监听行全是 PID 0），按命令行认人。
+        if self.api_up():
+            for pid, cl in _win_python_cmdlines():
+                if pid != os.getpid() and is_comfy_cmdline(cl):
+                    self.log("停止外部 ComfyUI (pid=%d)…" % pid)
+                    ok = self._kill_pid(pid, timeout)
+                    if ok:
+                        with self.lock:
+                            self.last_ok = 0
+                    return (ok, "已停止外部 ComfyUI (pid=%d)" % pid) if ok else (False, "停止失败（权限不足？）")
+            return False, "未找到 ComfyUI 进程（API 在但没匹配到 python 命令行）"
         return False, "没有正在运行的 ComfyUI"
 
     def _kill_tree(self, pid, timeout):
@@ -1206,10 +1299,21 @@ class ComfyUI:
         except OSError:
             pass
 
+    def _pid_alive(self, pid):
+        """tasklist 验证进程是否存活（taskkill 的 GBK 输出被 utf-8 解码后
+        “成功”两字匹配不上，不能信文本，只信结果）。"""
+        txt = run_cmd(["tasklist", "/FI", "PID eq %d" % pid, "/NH"], timeout=8)
+        return str(pid) in txt
+
     def _kill_pid(self, pid, timeout):
         if IS_WIN:
-            txt = run_cmd(["taskkill", "/PID", str(pid), "/T", "/F"], timeout=10)
-            return "SUCCESS" in txt or "成功" in txt
+            run_cmd(["taskkill", "/PID", str(pid), "/T", "/F"], timeout=10)
+            deadline = time.time() + timeout
+            while time.time() < deadline:
+                if not self._pid_alive(pid):
+                    return True
+                time.sleep(0.4)
+            return not self._pid_alive(pid)
         try:
             os.kill(pid, signal.SIGTERM)
         except OSError:
@@ -1464,7 +1568,7 @@ class Handler(BaseHTTPRequestHandler):
             ok, msg = st.comfy.start()
             self._json({"ok": ok, "msg": msg})
         elif path == "/api/comfy/stop":
-            ok, msg = st.comfy.stop()
+            ok, msg = st.comfy.stop(force=bool(body.get("force")))
             self._json({"ok": ok, "msg": msg})
         elif path == "/api/config":
             allowed = ("comfy_url", "workdir", "start_cmd", "stop_timeout")
