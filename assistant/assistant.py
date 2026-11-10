@@ -1455,7 +1455,7 @@ class State:
             vram_pct = g["mem_util"]
         return {
             "v": 1, "host": self.hostname, "ts": st["ts"],
-            "comfy": {"up": c["state"] == "running", "running": c["running"],
+            "comfy": {"up": c["state"] in ("running", "external"), "running": c["running"],
                       "pending": c["pending"], "ver": c["version"],
                       "job_ms": (st["ts"] - c["job_start_ms"]) if c["job_start_ms"] else 0},
             "gpu": {"name": g.get("name") or c.get("device_name", ""),

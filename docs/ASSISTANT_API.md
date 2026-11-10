@@ -255,7 +255,8 @@ ComfyUI 看板助手（assistant.py / exe，常驻）
 | `running` | API 就绪且**由助手托管** | true | 助手拉起并正常运行 |
 | `external` | API 就绪但**不是**助手拉起（或检测到外部进程） | false | 用户手动双击 run_nvidia.bat / 手动 python main.py |
 
-**调度站判"可用"只认 `state == "running" || state == "external"`（或 panel 的 `comfy.up`）**，
+**调度站判"可用"只认 `state == "running" || state == "external"`（或 panel 的 `comfy.up`，
+该字段对两种可用状态均返回 true）**，
 不要拿 `managed` 当可用条件——external 同样能干活。
 
 ---
