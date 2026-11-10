@@ -144,11 +144,13 @@ tools/gen_cn_fonts.sh    # 需要 Node/npx；字体首次会自动下载
 
 ComfyUI 的 8188 不提供 CPU/GPU 利用率、功耗等数据，因此每台主机可另跑一个只依赖 Python 标准库的助手（端口 A，默认 8189），面板开启 Ultra 后从 `http://<host>:8189/api/panel` 拉取并排版。
 
-```bash
-# 每台主机（Linux / Windows 通用）
-python3 assistant/assistant.py --port 8189      # Windows 双击 start.bat（桌面会话）
-curl http://127.0.0.1:8189/api/panel            # 自检
-```
+- Windows 免装 Python：直接下载 [ComfyUIPanelAssistant.exe（v1.3.1 Release）](https://github.com/LAZTUDIO/Comfyui-ESP32-LCD/releases/download/v1.3.1/ComfyUIPanelAssistant.exe)，双击运行（源码方式见下）。
+- 部署（每台主机 Linux / Windows 通用）：
+
+  ```bash
+  python3 assistant/assistant.py --port 8189      # Windows 双击 start.bat（桌面会话）
+  curl http://127.0.0.1:8189/api/panel            # 自检
+  ```
 
 - 面板：`设置 → 服务器` 页打开 `Ultra`、端口 A 填 `8189`；总览页立即按主机数重排。
 - 助手 WebUI：`http://<host>:8189/`，可查看完整硬件/日志并启停 ComfyUI（与本机手动启动一致）。
