@@ -332,6 +332,11 @@ POST /api/comfy/stop {}
 配置**立即生效并持久化**（写 exe 旁 `assistant_config.json`，重启不丢）。
 `stop_timeout` 为进程树终止前的优雅等待秒数。
 
+**v1.3.1 路径归一化**（Windows）：`workdir` 与 `start_cmd` 中的连续反斜杠会被自动
+收敛为单道（UNC 的 `\\` 开头前缀保留）。调用方无需担心 cmd / PowerShell / bash
+转义差异——发 `D:\\\\a\\\\b.bat` 或 `D:\a\b.bat`，落库均为 `D:\a\b.bat`。
+JSON 返回里的 `\\` 是转义显示，实际值只有一道。
+
 ---
 
 ## 7. 调度站集成清单（照抄即用）
